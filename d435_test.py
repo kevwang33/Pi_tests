@@ -28,7 +28,7 @@ STREAM_CANDIDATES = [
 # -----------------------------
 # Depth tuning
 # -----------------------------
-MIN_DEPTH_M = 0.10
+MIN_DEPTH_M = 0.04
 MAX_DEPTH_M = 2.00
 GREEN_THRESHOLD_M = 0.1524  # 6 inches
 
@@ -60,20 +60,20 @@ MASK_ERODE_KERNEL = (5, 3)
 # -----------------------------
 # Contour / rotated-rect filters
 # -----------------------------
-MIN_CONTOUR_AREA = 700
-MIN_MAJOR_AXIS_PX = 100
-MIN_ASPECT_RATIO = 4.5
-MAX_HORIZONTAL_DEVIATION_DEG = 12.0
-MIN_SOLIDITY = 0.45
-MIN_FILL_RATIO = 0.18
-MAX_FILL_RATIO = 0.90
+MIN_CONTOUR_AREA = 400
+MIN_MAJOR_AXIS_PX = 60
+MIN_ASPECT_RATIO = 2.8
+MAX_HORIZONTAL_DEVIATION_DEG = 15.0
+MIN_SOLIDITY = 0.35
+MIN_FILL_RATIO = 0.12
+MAX_FILL_RATIO = 0.95
 
 # -----------------------------
 # Depth voting
 # -----------------------------
-DEPTH_BIN_MM = 50
-MIN_VALID_DEPTH_RATIO = 0.12
-MIN_MAJORITY_RATIO = 0.35
+DEPTH_BIN_MM = 20
+MIN_VALID_DEPTH_RATIO = 0.05
+MIN_MAJORITY_RATIO = 0.18
 
 # -----------------------------
 # Debug Hough / parallel-line overlay
@@ -360,19 +360,28 @@ def detect_branch_candidates(color_image, depth_image):
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates = []
+    reject_reasons = {
+        "area": 0, "hull": 0, "solidity": 0, "minor_axis": 0,
+        "major_axis": 0, "aspect": 0, "fill": 0, "angle": 0,
+        "depth_none": 0, "valid_ratio": 0, "majority_ratio": 0,
+        "depth_range": 0,
+    }
 
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < MIN_CONTOUR_AREA:
+            reject_reasons["area"] += 1
             continue
 
         hull = cv2.convexHull(contour)
         hull_area = cv2.contourArea(hull)
         if hull_area <= 0:
+            reject_reasons["hull"] += 1
             continue
 
         solidity = area / hull_area
         if solidity < MIN_SOLIDITY:
+            reject_reasons["solidity"] += 1
             continue
 
         rect = cv2.minAreaRect(contour)
@@ -382,17 +391,21 @@ def detect_branch_candidates(color_image, depth_image):
         minor_axis = min(w, h)
 
         if minor_axis <= 0:
+            reject_reasons["minor_axis"] += 1
             continue
         if major_axis < MIN_MAJOR_AXIS_PX:
+            reject_reasons["major_axis"] += 1
             continue
 
         aspect_ratio = major_axis / minor_axis
         if aspect_ratio < MIN_ASPECT_RATIO:
+            reject_reasons["aspect"] += 1
             continue
 
         rect_area = max(major_axis * minor_axis, 1.0)
         fill_ratio = area / rect_area
         if fill_ratio < MIN_FILL_RATIO or fill_ratio > MAX_FILL_RATIO:
+            reject_reasons["fill"] += 1
             continue
 
         box = cv2.boxPoints(rect)
@@ -401,6 +414,7 @@ def detect_branch_candidates(color_image, depth_image):
         horizontal_angle = longest_edge_angle_deg(box)
         horizontal_dev = horizontal_deviation_degrees(horizontal_angle)
         if horizontal_dev > MAX_HORIZONTAL_DEVIATION_DEG:
+            reject_reasons["angle"] += 1
             continue
 
         # Depth vote on a shrunken contour mask so nearby clutter contributes less.
@@ -413,15 +427,19 @@ def detect_branch_candidates(color_image, depth_image):
 
         depth_vote = dominant_depth_from_mask(depth_image, full_mask)
         if depth_vote is None:
+            reject_reasons["depth_none"] += 1
             continue
 
         if depth_vote["valid_ratio"] < MIN_VALID_DEPTH_RATIO:
+            reject_reasons["valid_ratio"] += 1
             continue
         if depth_vote["majority_ratio"] < MIN_MAJORITY_RATIO:
+            reject_reasons["majority_ratio"] += 1
             continue
 
         depth_m = depth_vote["depth_m"]
         if not (MIN_DEPTH_M <= depth_m <= MAX_DEPTH_M):
+            reject_reasons["depth_range"] += 1
             continue
 
         candidate = {
@@ -443,7 +461,7 @@ def detect_branch_candidates(color_image, depth_image):
         candidate["score"] = contour_score(candidate, image_w)
         candidates.append(candidate)
 
-    return candidates, binary
+    return candidates, binary, reject_reasons
 
 
 pipeline, profile, active_profile = start_pipeline_with_fallback()
@@ -472,11 +490,11 @@ except Exception:
 spatial = rs.spatial_filter()
 spatial.set_option(rs.option.filter_magnitude, 1)
 spatial.set_option(rs.option.filter_smooth_alpha, 0.35)
-spatial.set_option(rs.option.filter_smooth_delta, 10)
+spatial.set_option(rs.option.filter_smooth_delta, 30)
 
 temporal = rs.temporal_filter()
 temporal.set_option(rs.option.filter_smooth_alpha, 0.25)
-temporal.set_option(rs.option.filter_smooth_delta, 10)
+temporal.set_option(rs.option.filter_smooth_delta, 30)
 
 print("Press 'q' to quit.")
 
@@ -537,7 +555,11 @@ try:
             debug_edges = np.zeros((COLOR_HEIGHT, COLOR_WIDTH), dtype=np.uint8)
 
         # Main contour-based detector in top third.
-        candidates, binary = detect_branch_candidates(color_image, depth_image)
+        candidates, binary, reject_reasons = detect_branch_candidates(color_image, depth_image)
+
+        active_rejects = {k: v for k, v in reject_reasons.items() if v > 0}
+        if active_rejects:
+            print(f"Rejects: {active_rejects}  |  Accepted: {len(candidates)}")
 
         best_candidate = max(candidates, key=lambda c: c["score"]) if candidates else None
 
