@@ -9,6 +9,7 @@ import pyrealsense2 as rs
 STREAM_CANDIDATES = [
     {
         "color_width": 640,
+        
         "color_height": 480,
         "color_fps": 15,
         "depth_width": 640,
