@@ -70,11 +70,20 @@ MASK_ERODE_KERNEL = (5, 3)
 # -----------------------------
 HOUGH_THRESHOLD = 35
 HOUGH_MIN_LINE_LENGTH = 60
-HOUGH_MAX_LINE_GAP = 20
+HOUGH_LINE_CONNECT_GAP_REFERENCE_PX = 20
+HOUGH_LINE_CONNECT_GAP_REFERENCE_DEPTH_M = 1.0
+HOUGH_LINE_CONNECT_GAP_MIN_PX = 8
+HOUGH_LINE_CONNECT_GAP_MAX_PX = 120
 
 MAX_HORIZONTAL_DEVIATION_DEG = 15.0
 MAX_PAIR_ANGLE_DIFF_DEG = 12.0
 MIN_ESTIMATED_LENGTH_M = 0.127  # 5 inches
+MIN_PAIR_GAP_M = 0.0254  # 1 inch
+MAX_PAIR_GAP_M = 0.0889  # 3.5 inches
+MIN_MEASURABLE_PAIR_GAP_PX = 4.0
+MERGE_LINE_ANGLE_DIFF_DEG = 4.0
+MERGE_LINE_OFFSET_PX = 8.0
+MERGE_MIN_OVERLAP_RATIO = 0.60
 PAIR_PAD_X = 10
 PAIR_PAD_Y = 6
 
@@ -170,10 +179,141 @@ def line_length(x1, y1, x2, y2):
     return float(np.hypot(x2 - x1, y2 - y1))
 
 
+def line_midpoint(line):
+    x1, y1, x2, y2 = line
+    return np.array([(x1 + x2) * 0.5, (y1 + y2) * 0.5], dtype=np.float32)
+
+
+def line_direction(line):
+    x1, y1, x2, y2 = line
+    dx = float(x2 - x1)
+    dy = float(y2 - y1)
+    length = np.hypot(dx, dy)
+    if length <= 0:
+        return np.array([1.0, 0.0], dtype=np.float32)
+    return np.array([dx / length, dy / length], dtype=np.float32)
+
+
+def pair_direction(line_a, line_b):
+    direction = line_direction(line_a) + line_direction(line_b)
+    norm = np.hypot(direction[0], direction[1])
+    if norm <= 1e-6:
+        return line_direction(line_a)
+    return direction / norm
+
+
+def line_projection_overlap_ratio(line_a, line_b):
+    direction = pair_direction(line_a, line_b)
+    a_points = [(line_a[0], line_a[1]), (line_a[2], line_a[3])]
+    b_points = [(line_b[0], line_b[1]), (line_b[2], line_b[3])]
+
+    a_proj = [float(np.dot(point, direction)) for point in a_points]
+    b_proj = [float(np.dot(point, direction)) for point in b_points]
+
+    a_min, a_max = min(a_proj), max(a_proj)
+    b_min, b_max = min(b_proj), max(b_proj)
+    overlap = max(0.0, min(a_max, b_max) - max(a_min, b_min))
+    min_length = min(a_max - a_min, b_max - b_min)
+    if min_length <= 0:
+        return 0.0
+    return overlap / min_length
+
+
+def line_pair_gap_px(line_a, line_b):
+    direction = pair_direction(line_a, line_b)
+    normal = np.array([-direction[1], direction[0]], dtype=np.float32)
+    return abs(float(np.dot(line_midpoint(line_b) - line_midpoint(line_a), normal)))
+
+
+def merge_similar_hough_lines(lines):
+    merged = []
+
+    for line in sorted(lines, key=lambda segment: line_length(*segment), reverse=True):
+        line_angle = line_angle_degrees(*line)
+        is_duplicate = False
+
+        for existing in merged:
+            angle_diff = angle_difference_degrees(line_angle, existing["angle_deg"])
+            if angle_diff > MERGE_LINE_ANGLE_DIFF_DEG:
+                continue
+
+            offset_px = line_pair_gap_px(line, existing["segment"])
+            if offset_px > MERGE_LINE_OFFSET_PX:
+                continue
+
+            overlap_ratio = line_projection_overlap_ratio(line, existing["segment"])
+            if overlap_ratio < MERGE_MIN_OVERLAP_RATIO:
+                continue
+
+            is_duplicate = True
+            break
+
+        if is_duplicate:
+            continue
+
+        merged.append(
+            {
+                "segment": line,
+                "angle_deg": line_angle,
+                "horizontal_dev_deg": horizontal_deviation_degrees(line_angle),
+                "length_px": line_length(*line),
+            }
+        )
+
+    return merged
+
+
 def estimate_length_m(pixel_length, depth_m, focal_length_px):
     if focal_length_px <= 0:
         return None
     return float(pixel_length) * float(depth_m) / float(focal_length_px)
+
+
+def estimate_pixels_for_length(length_m, depth_m, focal_length_px):
+    if depth_m <= 0:
+        return None
+    return float(length_m) * float(focal_length_px) / float(depth_m)
+
+
+def build_hough_gap_schedule(focal_length_px):
+    reference_gap_m = estimate_length_m(
+        HOUGH_LINE_CONNECT_GAP_REFERENCE_PX,
+        HOUGH_LINE_CONNECT_GAP_REFERENCE_DEPTH_M,
+        focal_length_px,
+    )
+    if reference_gap_m is None:
+        return [HOUGH_LINE_CONNECT_GAP_REFERENCE_PX]
+
+    depth_samples_m = [
+        MIN_DEPTH_M,
+        GREEN_THRESHOLD_M,
+        0.35,
+        0.50,
+        0.75,
+        1.00,
+        MAX_DEPTH_M,
+    ]
+
+    gap_schedule = []
+    for depth_m in depth_samples_m:
+        depth_m = float(np.clip(depth_m, MIN_DEPTH_M, MAX_DEPTH_M))
+        gap_px = estimate_pixels_for_length(reference_gap_m, depth_m, focal_length_px)
+        if gap_px is None:
+            continue
+
+        gap_px = int(
+            round(
+                np.clip(
+                    gap_px,
+                    HOUGH_LINE_CONNECT_GAP_MIN_PX,
+                    HOUGH_LINE_CONNECT_GAP_MAX_PX,
+                )
+            )
+        )
+        gap_schedule.append(gap_px)
+
+    gap_schedule.append(HOUGH_LINE_CONNECT_GAP_REFERENCE_PX)
+    return sorted(set(gap_schedule))
 
 
 def dominant_depth_from_mask(depth_image, mask):
@@ -301,26 +441,33 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px):
 
     candidates = []
     reject_reasons = {
-        "no_lines": 0, "angle": 0, "pair_angle": 0,
+        "no_lines": 0, "angle": 0, "duplicates": 0, "pair_angle": 0,
+        "pair_gap": 0,
         "minor_axis": 0, "length": 0,
         "depth_none": 0, "valid_ratio": 0, "majority_ratio": 0,
         "depth_range": 0,
     }
 
-    lines = cv2.HoughLinesP(
-        binary,
-        1,
-        np.pi / 180.0,
-        threshold=HOUGH_THRESHOLD,
-        minLineLength=HOUGH_MIN_LINE_LENGTH,
-        maxLineGap=HOUGH_MAX_LINE_GAP,
-    )
-    if lines is None:
+    raw_hough_lines = []
+    for line_gap_px in build_hough_gap_schedule(focal_length_px):
+        lines = cv2.HoughLinesP(
+            binary,
+            1,
+            np.pi / 180.0,
+            threshold=HOUGH_THRESHOLD,
+            minLineLength=HOUGH_MIN_LINE_LENGTH,
+            maxLineGap=line_gap_px,
+        )
+        if lines is None:
+            continue
+
+        raw_hough_lines.extend(tuple(map(int, line[0])) for line in lines)
+
+    raw_hough_lines = list(dict.fromkeys(raw_hough_lines))
+    if not raw_hough_lines:
         reject_reasons["no_lines"] += 1
         return candidates, [], reject_reasons
-
-    raw_hough_lines = [tuple(map(int, line[0])) for line in lines]
-    filtered_lines = []
+    horizontal_lines = []
     for x1, y1, x2, y2 in raw_hough_lines:
         angle = line_angle_degrees(x1, y1, x2, y2)
         horizontal_dev = horizontal_deviation_degrees(angle)
@@ -328,13 +475,10 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px):
             reject_reasons["angle"] += 1
             continue
 
-        filtered_lines.append(
-            {
-                "segment": (x1, y1, x2, y2),
-                "angle_deg": angle,
-                "horizontal_dev_deg": horizontal_dev,
-            }
-        )
+        horizontal_lines.append((x1, y1, x2, y2))
+
+    filtered_lines = merge_similar_hough_lines(horizontal_lines)
+    reject_reasons["duplicates"] += max(0, len(horizontal_lines) - len(filtered_lines))
 
     for i in range(len(filtered_lines)):
         line_a = filtered_lines[i]
@@ -397,10 +541,31 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px):
                 reject_reasons["depth_range"] += 1
                 continue
 
-            estimated_length_m = estimate_length_m(major_axis, depth_m, focal_length_px)
-            if estimated_length_m is None or estimated_length_m < MIN_ESTIMATED_LENGTH_M:
+            line_a_length_m = estimate_length_m(
+                line_a["length_px"], depth_m, focal_length_px
+            )
+            line_b_length_m = estimate_length_m(
+                line_b["length_px"], depth_m, focal_length_px
+            )
+            if line_a_length_m is None or line_b_length_m is None:
                 reject_reasons["length"] += 1
                 continue
+            if min(line_a_length_m, line_b_length_m) < MIN_ESTIMATED_LENGTH_M:
+                reject_reasons["length"] += 1
+                continue
+
+            pair_gap_px = line_pair_gap_px(line_a["segment"], line_b["segment"])
+            estimated_gap_m = None
+            if pair_gap_px >= MIN_MEASURABLE_PAIR_GAP_PX:
+                estimated_gap_m = estimate_length_m(pair_gap_px, depth_m, focal_length_px)
+                if estimated_gap_m is None:
+                    reject_reasons["pair_gap"] += 1
+                    continue
+                if not (MIN_PAIR_GAP_M <= estimated_gap_m <= MAX_PAIR_GAP_M):
+                    reject_reasons["pair_gap"] += 1
+                    continue
+
+            estimated_length_m = 0.5 * (line_a_length_m + line_b_length_m)
 
             bbox = clamp_bbox(
                 (
@@ -422,6 +587,11 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px):
                 "minor_axis": float(minor_axis),
                 "horizontal_dev_deg": float(horizontal_dev),
                 "depth_m": depth_m,
+                "line_a_length_m": float(line_a_length_m),
+                "line_b_length_m": float(line_b_length_m),
+                "pair_gap_m": (
+                    float(estimated_gap_m) if estimated_gap_m is not None else None
+                ),
                 "estimated_length_m": float(estimated_length_m),
                 "valid_ratio": depth_vote["valid_ratio"],
                 "majority_ratio": depth_vote["majority_ratio"],
