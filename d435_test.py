@@ -101,6 +101,81 @@ DRAW_TOP_REGION_LINE = True
 TOP_REGION_COLOR = (255, 255, 0)
 BOX_RED = (0, 0, 255)
 BOX_GREEN = (0, 255, 0)
+MAIN_WINDOW_NAME = "D435 Hough Line Branch Detection"
+CONTROL_WINDOW_NAME = "Raw Hough Controls"
+
+
+def _noop(_value):
+    pass
+
+
+def create_raw_hough_trackbars():
+    cv2.namedWindow(CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.createTrackbar("Canny Low", CONTROL_WINDOW_NAME, CANNY_LOW, 255, _noop)
+    cv2.createTrackbar("Canny High", CONTROL_WINDOW_NAME, CANNY_HIGH, 255, _noop)
+    cv2.createTrackbar(
+        "CLAHE x10",
+        CONTROL_WINDOW_NAME,
+        int(round(CLAHE_CLIP_LIMIT * 10.0)),
+        100,
+        _noop,
+    )
+    cv2.createTrackbar("Hough Thresh", CONTROL_WINDOW_NAME, HOUGH_THRESHOLD, 300, _noop)
+    cv2.createTrackbar(
+        "Min Line Len", CONTROL_WINDOW_NAME, HOUGH_MIN_LINE_LENGTH, 400, _noop
+    )
+    cv2.createTrackbar(
+        "Gap Ref Px",
+        CONTROL_WINDOW_NAME,
+        HOUGH_LINE_CONNECT_GAP_REFERENCE_PX,
+        200,
+        _noop,
+    )
+    cv2.createTrackbar(
+        "Gap Min Px",
+        CONTROL_WINDOW_NAME,
+        HOUGH_LINE_CONNECT_GAP_MIN_PX,
+        200,
+        _noop,
+    )
+    cv2.createTrackbar(
+        "Gap Max Px",
+        CONTROL_WINDOW_NAME,
+        HOUGH_LINE_CONNECT_GAP_MAX_PX,
+        300,
+        _noop,
+    )
+
+
+def get_raw_hough_runtime_params():
+    canny_low = cv2.getTrackbarPos("Canny Low", CONTROL_WINDOW_NAME)
+    canny_high = cv2.getTrackbarPos("Canny High", CONTROL_WINDOW_NAME)
+    clahe_clip_x10 = cv2.getTrackbarPos("CLAHE x10", CONTROL_WINDOW_NAME)
+    hough_threshold = cv2.getTrackbarPos("Hough Thresh", CONTROL_WINDOW_NAME)
+    hough_min_line_length = cv2.getTrackbarPos("Min Line Len", CONTROL_WINDOW_NAME)
+    gap_ref_px = cv2.getTrackbarPos("Gap Ref Px", CONTROL_WINDOW_NAME)
+    gap_min_px = cv2.getTrackbarPos("Gap Min Px", CONTROL_WINDOW_NAME)
+    gap_max_px = cv2.getTrackbarPos("Gap Max Px", CONTROL_WINDOW_NAME)
+
+    canny_low = int(np.clip(canny_low, 0, 254))
+    canny_high = int(np.clip(max(canny_high, canny_low + 1), 1, 255))
+    clahe_clip_limit = max(0.1, clahe_clip_x10 / 10.0)
+    hough_threshold = max(1, hough_threshold)
+    hough_min_line_length = max(1, hough_min_line_length)
+    gap_ref_px = max(1, gap_ref_px)
+    gap_min_px = max(1, gap_min_px)
+    gap_max_px = max(gap_min_px, gap_max_px)
+
+    return {
+        "canny_low": canny_low,
+        "canny_high": canny_high,
+        "clahe_clip_limit": clahe_clip_limit,
+        "hough_threshold": hough_threshold,
+        "hough_min_line_length": hough_min_line_length,
+        "gap_ref_px": gap_ref_px,
+        "gap_min_px": gap_min_px,
+        "gap_max_px": gap_max_px,
+    }
 
 
 def start_pipeline_with_fallback():
@@ -275,14 +350,14 @@ def estimate_pixels_for_length(length_m, depth_m, focal_length_px):
     return float(length_m) * float(focal_length_px) / float(depth_m)
 
 
-def build_hough_gap_schedule(focal_length_px):
+def build_hough_gap_schedule(focal_length_px, runtime_params):
     reference_gap_m = estimate_length_m(
-        HOUGH_LINE_CONNECT_GAP_REFERENCE_PX,
+        runtime_params["gap_ref_px"],
         HOUGH_LINE_CONNECT_GAP_REFERENCE_DEPTH_M,
         focal_length_px,
     )
     if reference_gap_m is None:
-        return [HOUGH_LINE_CONNECT_GAP_REFERENCE_PX]
+        return [runtime_params["gap_ref_px"]]
 
     depth_samples_m = [
         MIN_DEPTH_M,
@@ -305,14 +380,14 @@ def build_hough_gap_schedule(focal_length_px):
             round(
                 np.clip(
                     gap_px,
-                    HOUGH_LINE_CONNECT_GAP_MIN_PX,
-                    HOUGH_LINE_CONNECT_GAP_MAX_PX,
+                    runtime_params["gap_min_px"],
+                    runtime_params["gap_max_px"],
                 )
             )
         )
         gap_schedule.append(gap_px)
 
-    gap_schedule.append(HOUGH_LINE_CONNECT_GAP_REFERENCE_PX)
+    gap_schedule.append(runtime_params["gap_ref_px"])
     return sorted(set(gap_schedule))
 
 
@@ -416,7 +491,7 @@ def suppress_overlapping_candidates(candidates, iou_threshold=0.45):
     return kept
 
 
-def detect_branch_candidates(color_image, depth_image, focal_length_px):
+def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_params):
     image_h, image_w = color_image.shape[:2]
     top_limit = int(image_h * TOP_REGION_FRACTION)
 
@@ -424,13 +499,13 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px):
     gray = cv2.cvtColor(search_region, cv2.COLOR_BGR2GRAY)
 
     clahe = cv2.createCLAHE(
-        clipLimit=CLAHE_CLIP_LIMIT,
+        clipLimit=runtime_params["clahe_clip_limit"],
         tileGridSize=CLAHE_TILE_GRID,
     )
     gray = clahe.apply(gray)
     blurred = cv2.GaussianBlur(gray, GAUSSIAN_KERNEL, 0)
 
-    edges = cv2.Canny(blurred, CANNY_LOW, CANNY_HIGH)
+    edges = cv2.Canny(blurred, runtime_params["canny_low"], runtime_params["canny_high"])
 
     close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_CLOSE_KERNEL)
     open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_OPEN_KERNEL)
@@ -449,13 +524,13 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px):
     }
 
     raw_hough_lines = []
-    for line_gap_px in build_hough_gap_schedule(focal_length_px):
+    for line_gap_px in build_hough_gap_schedule(focal_length_px, runtime_params):
         lines = cv2.HoughLinesP(
             binary,
             1,
             np.pi / 180.0,
-            threshold=HOUGH_THRESHOLD,
-            minLineLength=HOUGH_MIN_LINE_LENGTH,
+            threshold=runtime_params["hough_threshold"],
+            minLineLength=runtime_params["hough_min_line_length"],
             maxLineGap=line_gap_px,
         )
         if lines is None:
@@ -640,6 +715,7 @@ temporal = rs.temporal_filter()
 temporal.set_option(rs.option.filter_smooth_alpha, 0.25)
 temporal.set_option(rs.option.filter_smooth_delta, 30)
 
+create_raw_hough_trackbars()
 print("Press 'q' to quit.")
 
 try:
@@ -686,11 +762,14 @@ try:
             cv2.line(display_image, (0, top_limit), (COLOR_WIDTH, top_limit), TOP_REGION_COLOR, 2)
             cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
 
+        runtime_params = get_raw_hough_runtime_params()
+
         # Main Hough-line detector in top half.
         candidates, raw_hough_lines, reject_reasons = detect_branch_candidates(
             color_image,
             depth_image,
             COLOR_FOCAL_LENGTH_PX,
+            runtime_params,
         )
 
         active_rejects = {k: v for k, v in reject_reasons.items() if v > 0}
@@ -792,11 +871,36 @@ try:
             255,
             2,
         )
+        cv2.putText(
+            hough_debug_image,
+            (
+                f"Canny {runtime_params['canny_low']}/{runtime_params['canny_high']}  "
+                f"Hough {runtime_params['hough_threshold']}"
+            ),
+            (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            255,
+            1,
+        )
+        cv2.putText(
+            hough_debug_image,
+            (
+                f"MinLen {runtime_params['hough_min_line_length']}  "
+                f"GapRef {runtime_params['gap_ref_px']}  "
+                f"GapRange {runtime_params['gap_min_px']}-{runtime_params['gap_max_px']}"
+            ),
+            (10, 115),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            255,
+            1,
+        )
 
         hough_debug_bgr = cv2.cvtColor(hough_debug_image, cv2.COLOR_GRAY2BGR)
         combined = np.hstack((display_image, depth_colormap, hough_debug_bgr))
 
-        cv2.imshow("D435 Hough Line Branch Detection", combined)
+        cv2.imshow(MAIN_WINDOW_NAME, combined)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
