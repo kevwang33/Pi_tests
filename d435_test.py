@@ -94,7 +94,6 @@ MIN_MAJORITY_RATIO = 0.18
 # Display / debugging
 # -----------------------------
 DRAW_TOP_THIRD_LINE = True
-DRAW_BINARY_VIEW = True
 YELLOW = (0, 255, 255)
 
 
@@ -318,6 +317,8 @@ def detect_branch_candidates(color_image, depth_image):
     binary = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_kernel)
 
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
     candidates = []
     reject_reasons = {
         "no_lines": 0, "short_line": 0, "angle": 0, "pair_angle": 0,
@@ -337,7 +338,7 @@ def detect_branch_candidates(color_image, depth_image):
     )
     if lines is None:
         reject_reasons["no_lines"] += 1
-        return candidates, binary, reject_reasons
+        return candidates, contours, reject_reasons
 
     filtered_lines = []
     for line in lines:
@@ -487,7 +488,7 @@ def detect_branch_candidates(color_image, depth_image):
             candidates.append(candidate)
 
     candidates = suppress_overlapping_candidates(candidates)
-    return candidates, binary, reject_reasons
+    return candidates, contours, reject_reasons
 
 
 pipeline, profile, active_profile = start_pipeline_with_fallback()
@@ -567,13 +568,17 @@ try:
             cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
 
         # Main Hough-line detector in top third.
-        candidates, binary, reject_reasons = detect_branch_candidates(color_image, depth_image)
+        candidates, contours, reject_reasons = detect_branch_candidates(color_image, depth_image)
 
         active_rejects = {k: v for k, v in reject_reasons.items() if v > 0}
         if active_rejects:
             print(f"Rejects: {active_rejects}  |  Accepted: {len(candidates)}")
 
         best_candidate = max(candidates, key=lambda c: c["score"]) if candidates else None
+
+        # Draw contour outlines in the search region for context.
+        if contours:
+            cv2.drawContours(display_image[:top_limit, :], contours, -1, YELLOW, 1)
 
         # Draw all accepted line pairs in yellow first.
         for candidate in candidates:
@@ -654,29 +659,7 @@ try:
             2,
         )
 
-        if DRAW_BINARY_VIEW:
-            binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-            binary_bgr = cv2.resize(binary_bgr, (COLOR_WIDTH, COLOR_HEIGHT))
-            diagnostic_panel = np.zeros((COLOR_HEIGHT, COLOR_WIDTH * 2, 3), dtype=np.uint8)
-            diagnostic_panel[:, :COLOR_WIDTH] = binary_bgr
-            cv2.putText(
-                diagnostic_panel,
-                "Hough Binary",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                YELLOW,
-                2,
-            )
-
-            combined = np.vstack(
-                (
-                    np.hstack((display_image, depth_colormap)),
-                    diagnostic_panel,
-                )
-            )
-        else:
-            combined = np.hstack((display_image, depth_colormap))
+        combined = np.hstack((display_image, depth_colormap))
 
         cv2.imshow("D435 Hough Line Branch Detection", combined)
 
