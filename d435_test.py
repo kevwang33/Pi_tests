@@ -94,7 +94,10 @@ MIN_MAJORITY_RATIO = 0.18
 # Display / debugging
 # -----------------------------
 DRAW_TOP_THIRD_LINE = True
-YELLOW = (0, 255, 255)
+TOP_REGION_COLOR = (255, 255, 0)
+DEBUG_LINE_COLOR = (255, 255, 0)
+BOX_RED = (0, 0, 255)
+BOX_GREEN = (0, 255, 0)
 
 
 def start_pipeline_with_fallback():
@@ -232,12 +235,8 @@ def dominant_depth_from_mask(depth_image, mask):
 
 def depth_to_branch_color(depth_m):
     if depth_m <= GREEN_THRESHOLD_M:
-        return (0, 255, 0)
-
-    normalized = (MAX_DEPTH_M - depth_m) / (MAX_DEPTH_M - GREEN_THRESHOLD_M)
-    normalized = np.clip(normalized, 0.0, 1.0)
-    blue_value = int(80 + normalized * (255 - 80))
-    return (blue_value, 0, 0)
+        return BOX_GREEN
+    return BOX_RED
 
 
 def candidate_score(candidate, image_width):
@@ -317,8 +316,6 @@ def detect_branch_candidates(color_image, depth_image):
     binary = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_kernel)
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     candidates = []
     reject_reasons = {
         "no_lines": 0, "short_line": 0, "angle": 0, "pair_angle": 0,
@@ -338,7 +335,7 @@ def detect_branch_candidates(color_image, depth_image):
     )
     if lines is None:
         reject_reasons["no_lines"] += 1
-        return candidates, contours, reject_reasons
+        return candidates, [], reject_reasons
 
     filtered_lines = []
     for line in lines:
@@ -488,7 +485,8 @@ def detect_branch_candidates(color_image, depth_image):
             candidates.append(candidate)
 
     candidates = suppress_overlapping_candidates(candidates)
-    return candidates, contours, reject_reasons
+    debug_lines = [line["segment"] for line in filtered_lines]
+    return candidates, debug_lines, reject_reasons
 
 
 pipeline, profile, active_profile = start_pipeline_with_fallback()
@@ -563,12 +561,15 @@ try:
         depth_colormap = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
 
         top_limit = int(COLOR_HEIGHT * TOP_REGION_FRACTION)
+        hough_debug_image = color_image.copy()
+
         if DRAW_TOP_THIRD_LINE:
-            cv2.line(display_image, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 0), 2)
+            cv2.line(display_image, (0, top_limit), (COLOR_WIDTH, top_limit), TOP_REGION_COLOR, 2)
+            cv2.line(hough_debug_image, (0, top_limit), (COLOR_WIDTH, top_limit), TOP_REGION_COLOR, 2)
             cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
 
         # Main Hough-line detector in top third.
-        candidates, contours, reject_reasons = detect_branch_candidates(color_image, depth_image)
+        candidates, debug_lines, reject_reasons = detect_branch_candidates(color_image, depth_image)
 
         active_rejects = {k: v for k, v in reject_reasons.items() if v > 0}
         if active_rejects:
@@ -576,16 +577,9 @@ try:
 
         best_candidate = max(candidates, key=lambda c: c["score"]) if candidates else None
 
-        # Draw contour outlines in the search region for context.
-        if contours:
-            cv2.drawContours(display_image[:top_limit, :], contours, -1, YELLOW, 1)
-
-        # Draw all accepted line pairs in yellow first.
-        for candidate in candidates:
-            for line in candidate["lines"]:
-                x1, y1, x2, y2 = line
-                cv2.line(display_image, (x1, y1), (x2, y2), YELLOW, 1)
-            cv2.polylines(display_image, [candidate["box"]], True, YELLOW, 2)
+        for line in debug_lines:
+            x1, y1, x2, y2 = line
+            cv2.line(hough_debug_image, (x1, y1), (x2, y2), DEBUG_LINE_COLOR, 2)
 
         # Draw final accepted branch candidates with distance color.
         for candidate in candidates:
@@ -593,13 +587,26 @@ try:
             thickness = 4 if candidate is best_candidate else 2
 
             cv2.polylines(display_image, [candidate["box"]], True, color, thickness)
+            cv2.polylines(depth_colormap, [candidate["box"]], True, color, thickness)
+            cv2.polylines(hough_debug_image, [candidate["box"]], True, color, thickness)
 
             cx, cy = candidate["center"]
             cv2.circle(display_image, (int(cx), int(cy)), 4, color, -1)
+            cv2.circle(depth_colormap, (int(cx), int(cy)), 4, color, -1)
+            cv2.circle(hough_debug_image, (int(cx), int(cy)), 4, color, -1)
 
             x, y, w, h = cv2.boundingRect(candidate["box"])
             cv2.putText(
                 display_image,
+                f"{candidate['depth_m']:.2f}m",
+                (x, max(20, y - 5)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+            )
+            cv2.putText(
+                depth_colormap,
                 f"{candidate['depth_m']:.2f}m",
                 (x, max(20, y - 5)),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -626,6 +633,24 @@ try:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (0, 255, 0),
+            2,
+        )
+        cv2.putText(
+            hough_debug_image,
+            f"Hough lines: {len(debug_lines)}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            DEBUG_LINE_COLOR,
+            2,
+        )
+        cv2.putText(
+            hough_debug_image,
+            f"Accepted boxes: {len(candidates)}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (255, 255, 255),
             2,
         )
 
@@ -658,8 +683,17 @@ try:
             (255, 255, 255),
             2,
         )
+        cv2.putText(
+            hough_debug_image,
+            "Filtered Hough Lines",
+            (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            (255, 255, 255),
+            2,
+        )
 
-        combined = np.hstack((display_image, depth_colormap))
+        combined = np.hstack((display_image, depth_colormap, hough_debug_image))
 
         cv2.imshow("D435 Hough Line Branch Detection", combined)
 
