@@ -38,7 +38,7 @@ STREAM_CANDIDATES = [
 # -----------------------------
 MIN_DEPTH_M = 0.04
 MAX_DEPTH_M = 2.00
-GREEN_THRESHOLD_M = 0.1524  # 6 inches
+GREEN_THRESHOLD_M = 0.20
 
 MIN_DEPTH_MM = int(MIN_DEPTH_M * 1000)
 MAX_DEPTH_MM = int(MAX_DEPTH_M * 1000)
@@ -46,7 +46,7 @@ MAX_DEPTH_MM = int(MAX_DEPTH_M * 1000)
 # -----------------------------
 # Main Hough-line detector region
 # -----------------------------
-TOP_REGION_FRACTION = 1.0 / 3.0
+TOP_REGION_FRACTION = 1.0 / 2.0
 
 # -----------------------------
 # RGB preprocessing
@@ -72,14 +72,9 @@ HOUGH_THRESHOLD = 35
 HOUGH_MIN_LINE_LENGTH = 60
 HOUGH_MAX_LINE_GAP = 20
 
-MIN_PAIR_AREA = 250
-MIN_MAJOR_AXIS_PX = 60
-MIN_ASPECT_RATIO = 2.0
 MAX_HORIZONTAL_DEVIATION_DEG = 15.0
 MAX_PAIR_ANGLE_DIFF_DEG = 12.0
-MAX_PAIR_DISTANCE_PX = 120.0
-MIN_PAIR_VERTICAL_SEPARATION_PX = 8.0
-MIN_HORIZONTAL_OVERLAP_PX = 40.0
+MIN_ESTIMATED_LENGTH_M = 0.127  # 5 inches
 PAIR_PAD_X = 10
 PAIR_PAD_Y = 6
 
@@ -93,9 +88,8 @@ MIN_MAJORITY_RATIO = 0.18
 # -----------------------------
 # Display / debugging
 # -----------------------------
-DRAW_TOP_THIRD_LINE = True
+DRAW_TOP_REGION_LINE = True
 TOP_REGION_COLOR = (255, 255, 0)
-DEBUG_LINE_COLOR = (255, 255, 0)
 BOX_RED = (0, 0, 255)
 BOX_GREEN = (0, 255, 0)
 
@@ -146,21 +140,6 @@ def angle_difference_degrees(angle_a, angle_b):
     return min(difference, 180.0 - difference)
 
 
-def line_midpoint(x1, y1, x2, y2):
-    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-
-
-def x_range_of_line(line):
-    x1, _, x2, _ = line
-    return min(x1, x2), max(x1, x2)
-
-
-def horizontal_overlap(line_a, line_b):
-    a_min, a_max = x_range_of_line(line_a)
-    b_min, b_max = x_range_of_line(line_b)
-    return max(0.0, min(a_max, b_max) - max(a_min, b_min))
-
-
 def clamp_bbox(bbox, width, height):
     x1, y1, x2, y2 = bbox
     x1 = int(np.clip(x1, 0, width - 1))
@@ -189,6 +168,12 @@ def longest_edge_angle_deg(box_points):
 
 def line_length(x1, y1, x2, y2):
     return float(np.hypot(x2 - x1, y2 - y1))
+
+
+def estimate_length_m(pixel_length, depth_m, focal_length_px):
+    if focal_length_px <= 0:
+        return None
+    return float(pixel_length) * float(depth_m) / float(focal_length_px)
 
 
 def dominant_depth_from_mask(depth_image, mask):
@@ -247,15 +232,13 @@ def candidate_score(candidate, image_width):
     horizontal_bonus = 1.0 - candidate["horizontal_dev_deg"] / MAX_HORIZONTAL_DEVIATION_DEG
     horizontal_bonus = np.clip(horizontal_bonus, 0.0, 1.0)
 
-    overlap_bonus = np.clip(candidate["overlap_px"] / 200.0, 0.0, 1.0)
-    span_bonus = np.clip(candidate["major_axis"] / 250.0, 0.0, 1.0)
+    length_bonus = np.clip(candidate["estimated_length_m"] / 0.40, 0.0, 1.0)
 
     return (
-        0.30 * center_bonus
+        0.35 * center_bonus
         + 0.25 * horizontal_bonus
-        + 0.20 * overlap_bonus
+        + 0.25 * length_bonus
         + 0.15 * candidate["majority_ratio"]
-        + 0.10 * span_bonus
     )
 
 
@@ -293,7 +276,7 @@ def suppress_overlapping_candidates(candidates, iou_threshold=0.45):
     return kept
 
 
-def detect_branch_candidates(color_image, depth_image):
+def detect_branch_candidates(color_image, depth_image, focal_length_px):
     image_h, image_w = color_image.shape[:2]
     top_limit = int(image_h * TOP_REGION_FRACTION)
 
@@ -318,9 +301,8 @@ def detect_branch_candidates(color_image, depth_image):
 
     candidates = []
     reject_reasons = {
-        "no_lines": 0, "short_line": 0, "angle": 0, "pair_angle": 0,
-        "pair_distance": 0, "pair_separation": 0, "pair_overlap": 0,
-        "pair_area": 0, "minor_axis": 0, "major_axis": 0, "aspect": 0,
+        "no_lines": 0, "angle": 0, "pair_angle": 0,
+        "minor_axis": 0, "length": 0,
         "depth_none": 0, "valid_ratio": 0, "majority_ratio": 0,
         "depth_range": 0,
     }
@@ -337,14 +319,9 @@ def detect_branch_candidates(color_image, depth_image):
         reject_reasons["no_lines"] += 1
         return candidates, [], reject_reasons
 
+    raw_hough_lines = [tuple(map(int, line[0])) for line in lines]
     filtered_lines = []
-    for line in lines:
-        x1, y1, x2, y2 = map(int, line[0])
-        length_px = line_length(x1, y1, x2, y2)
-        if length_px < MIN_MAJOR_AXIS_PX:
-            reject_reasons["short_line"] += 1
-            continue
-
+    for x1, y1, x2, y2 in raw_hough_lines:
         angle = line_angle_degrees(x1, y1, x2, y2)
         horizontal_dev = horizontal_deviation_degrees(angle)
         if horizontal_dev > MAX_HORIZONTAL_DEVIATION_DEG:
@@ -356,8 +333,6 @@ def detect_branch_candidates(color_image, depth_image):
                 "segment": (x1, y1, x2, y2),
                 "angle_deg": angle,
                 "horizontal_dev_deg": horizontal_dev,
-                "midpoint": line_midpoint(x1, y1, x2, y2),
-                "length_px": length_px,
             }
         )
 
@@ -374,33 +349,11 @@ def detect_branch_candidates(color_image, depth_image):
                 reject_reasons["pair_angle"] += 1
                 continue
 
-            midpoint_distance = np.hypot(
-                line_a["midpoint"][0] - line_b["midpoint"][0],
-                line_a["midpoint"][1] - line_b["midpoint"][1],
-            )
-            if midpoint_distance > MAX_PAIR_DISTANCE_PX:
-                reject_reasons["pair_distance"] += 1
-                continue
-
-            vertical_separation = abs(line_a["midpoint"][1] - line_b["midpoint"][1])
-            if vertical_separation < MIN_PAIR_VERTICAL_SEPARATION_PX:
-                reject_reasons["pair_separation"] += 1
-                continue
-
-            overlap_px = horizontal_overlap(line_a["segment"], line_b["segment"])
-            if overlap_px < MIN_HORIZONTAL_OVERLAP_PX:
-                reject_reasons["pair_overlap"] += 1
-                continue
-
             pair_points = np.array(
                 [(ax1, ay1), (ax2, ay2), (bx1, by1), (bx2, by2)],
                 dtype=np.int32,
             )
             pair_hull = cv2.convexHull(pair_points)
-            area = cv2.contourArea(pair_hull)
-            if area < MIN_PAIR_AREA:
-                reject_reasons["pair_area"] += 1
-                continue
 
             rect = cv2.minAreaRect(pair_hull)
             (cx, cy), (w, h), _ = rect
@@ -409,14 +362,6 @@ def detect_branch_candidates(color_image, depth_image):
 
             if minor_axis <= 0:
                 reject_reasons["minor_axis"] += 1
-                continue
-            if major_axis < MIN_MAJOR_AXIS_PX:
-                reject_reasons["major_axis"] += 1
-                continue
-
-            aspect_ratio = major_axis / minor_axis
-            if aspect_ratio < MIN_ASPECT_RATIO:
-                reject_reasons["aspect"] += 1
                 continue
 
             box = cv2.boxPoints(rect)
@@ -452,6 +397,11 @@ def detect_branch_candidates(color_image, depth_image):
                 reject_reasons["depth_range"] += 1
                 continue
 
+            estimated_length_m = estimate_length_m(major_axis, depth_m, focal_length_px)
+            if estimated_length_m is None or estimated_length_m < MIN_ESTIMATED_LENGTH_M:
+                reject_reasons["length"] += 1
+                continue
+
             bbox = clamp_bbox(
                 (
                     min(ax1, ax2, bx1, bx2) - PAIR_PAD_X,
@@ -468,15 +418,11 @@ def detect_branch_candidates(color_image, depth_image):
                 "box": box,
                 "bbox": bbox,
                 "center": (float(cx), float(cy)),
-                "area": float(area),
                 "major_axis": float(major_axis),
                 "minor_axis": float(minor_axis),
-                "aspect_ratio": float(aspect_ratio),
                 "horizontal_dev_deg": float(horizontal_dev),
-                "overlap_px": float(overlap_px),
-                "midpoint_distance_px": float(midpoint_distance),
-                "vertical_separation_px": float(vertical_separation),
                 "depth_m": depth_m,
+                "estimated_length_m": float(estimated_length_m),
                 "valid_ratio": depth_vote["valid_ratio"],
                 "majority_ratio": depth_vote["majority_ratio"],
                 "mask": full_mask,
@@ -485,8 +431,7 @@ def detect_branch_candidates(color_image, depth_image):
             candidates.append(candidate)
 
     candidates = suppress_overlapping_candidates(candidates)
-    debug_lines = [line["segment"] for line in filtered_lines]
-    return candidates, debug_lines, reject_reasons
+    return candidates, raw_hough_lines, reject_reasons
 
 
 pipeline, profile, active_profile = start_pipeline_with_fallback()
@@ -494,6 +439,10 @@ align = rs.align(rs.stream.color)
 
 COLOR_WIDTH = active_profile["color_width"]
 COLOR_HEIGHT = active_profile["color_height"]
+color_stream_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+color_intrinsics = color_stream_profile.get_intrinsics()
+COLOR_FOCAL_LENGTH_PX = float(color_intrinsics.fx)
+print(f"Color focal length: {COLOR_FOCAL_LENGTH_PX:.2f}px")
 
 depth_sensor = profile.get_device().first_depth_sensor()
 
@@ -561,15 +510,18 @@ try:
         depth_colormap = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
 
         top_limit = int(COLOR_HEIGHT * TOP_REGION_FRACTION)
-        hough_debug_image = color_image.copy()
+        hough_debug_image = np.zeros((COLOR_HEIGHT, COLOR_WIDTH), dtype=np.uint8)
 
-        if DRAW_TOP_THIRD_LINE:
+        if DRAW_TOP_REGION_LINE:
             cv2.line(display_image, (0, top_limit), (COLOR_WIDTH, top_limit), TOP_REGION_COLOR, 2)
-            cv2.line(hough_debug_image, (0, top_limit), (COLOR_WIDTH, top_limit), TOP_REGION_COLOR, 2)
             cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
 
-        # Main Hough-line detector in top third.
-        candidates, debug_lines, reject_reasons = detect_branch_candidates(color_image, depth_image)
+        # Main Hough-line detector in top half.
+        candidates, raw_hough_lines, reject_reasons = detect_branch_candidates(
+            color_image,
+            depth_image,
+            COLOR_FOCAL_LENGTH_PX,
+        )
 
         active_rejects = {k: v for k, v in reject_reasons.items() if v > 0}
         if active_rejects:
@@ -577,9 +529,9 @@ try:
 
         best_candidate = max(candidates, key=lambda c: c["score"]) if candidates else None
 
-        for line in debug_lines:
+        for line in raw_hough_lines:
             x1, y1, x2, y2 = line
-            cv2.line(hough_debug_image, (x1, y1), (x2, y2), DEBUG_LINE_COLOR, 2)
+            cv2.line(hough_debug_image, (x1, y1), (x2, y2), 255, 2)
 
         # Draw final accepted branch candidates with distance color.
         for candidate in candidates:
@@ -587,26 +539,13 @@ try:
             thickness = 4 if candidate is best_candidate else 2
 
             cv2.polylines(display_image, [candidate["box"]], True, color, thickness)
-            cv2.polylines(depth_colormap, [candidate["box"]], True, color, thickness)
-            cv2.polylines(hough_debug_image, [candidate["box"]], True, color, thickness)
 
             cx, cy = candidate["center"]
             cv2.circle(display_image, (int(cx), int(cy)), 4, color, -1)
-            cv2.circle(depth_colormap, (int(cx), int(cy)), 4, color, -1)
-            cv2.circle(hough_debug_image, (int(cx), int(cy)), 4, color, -1)
 
             x, y, w, h = cv2.boundingRect(candidate["box"])
             cv2.putText(
                 display_image,
-                f"{candidate['depth_m']:.2f}m",
-                (x, max(20, y - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                color,
-                2,
-            )
-            cv2.putText(
-                depth_colormap,
                 f"{candidate['depth_m']:.2f}m",
                 (x, max(20, y - 5)),
                 cv2.FONT_HERSHEY_SIMPLEX,
@@ -637,20 +576,11 @@ try:
         )
         cv2.putText(
             hough_debug_image,
-            f"Hough lines: {len(debug_lines)}",
+            f"Hough lines: {len(raw_hough_lines)}",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            DEBUG_LINE_COLOR,
-            2,
-        )
-        cv2.putText(
-            hough_debug_image,
-            f"Accepted boxes: {len(candidates)}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (255, 255, 255),
+            255,
             2,
         )
 
@@ -666,7 +596,7 @@ try:
             )
             cv2.putText(
                 display_image,
-                f"Aspect: {best_candidate['aspect_ratio']:.1f}  Overlap: {best_candidate['overlap_px']:.0f}px",
+                f"Length: {best_candidate['estimated_length_m'] * 39.3701:.1f} in",
                 (10, 120),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
@@ -685,15 +615,16 @@ try:
         )
         cv2.putText(
             hough_debug_image,
-            "Filtered Hough Lines",
-            (10, 90),
+            "Raw Hough Lines",
+            (10, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.60,
-            (255, 255, 255),
+            255,
             2,
         )
 
-        combined = np.hstack((display_image, depth_colormap, hough_debug_image))
+        hough_debug_bgr = cv2.cvtColor(hough_debug_image, cv2.COLOR_GRAY2BGR)
+        combined = np.hstack((display_image, depth_colormap, hough_debug_bgr))
 
         cv2.imshow("D435 Hough Line Branch Detection", combined)
 
