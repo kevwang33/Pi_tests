@@ -1,6 +1,13 @@
 import cv2
 import numpy as np
-import pyrealsense2 as rs
+
+try:
+    import pyrealsense2 as rs
+except ImportError as exc:
+    raise ImportError(
+        "This script requires `pyrealsense2` for the Intel RealSense D435 camera. "
+        "Install dependencies with: pip install numpy opencv-python pyrealsense2"
+    ) from exc
 
 
 # -----------------------------
@@ -37,7 +44,7 @@ MIN_DEPTH_MM = int(MIN_DEPTH_M * 1000)
 MAX_DEPTH_MM = int(MAX_DEPTH_M * 1000)
 
 # -----------------------------
-# Main contour detector region
+# Main Hough-line detector region
 # -----------------------------
 TOP_REGION_FRACTION = 1.0 / 3.0
 
@@ -55,19 +62,26 @@ CLAHE_TILE_GRID = (8, 8)
 MORPH_CLOSE_KERNEL = (13, 5)
 MORPH_OPEN_KERNEL = (5, 3)
 
-# Used to shrink contour mask before depth voting.
+# Used to tighten the filled line-pair mask before depth voting.
 MASK_ERODE_KERNEL = (5, 3)
 
 # -----------------------------
-# Contour / rotated-rect filters
+# Hough-line / line-pair filters
 # -----------------------------
-MIN_CONTOUR_AREA = 400
+HOUGH_THRESHOLD = 35
+HOUGH_MIN_LINE_LENGTH = 60
+HOUGH_MAX_LINE_GAP = 20
+
+MIN_PAIR_AREA = 250
 MIN_MAJOR_AXIS_PX = 60
-MIN_ASPECT_RATIO = 2.8
+MIN_ASPECT_RATIO = 2.0
 MAX_HORIZONTAL_DEVIATION_DEG = 15.0
-MIN_SOLIDITY = 0.35
-MIN_FILL_RATIO = 0.12
-MAX_FILL_RATIO = 0.95
+MAX_PAIR_ANGLE_DIFF_DEG = 12.0
+MAX_PAIR_DISTANCE_PX = 120.0
+MIN_PAIR_VERTICAL_SEPARATION_PX = 8.0
+MIN_HORIZONTAL_OVERLAP_PX = 40.0
+PAIR_PAD_X = 10
+PAIR_PAD_Y = 6
 
 # -----------------------------
 # Depth voting
@@ -75,23 +89,6 @@ MAX_FILL_RATIO = 0.95
 DEPTH_BIN_MM = 20
 MIN_VALID_DEPTH_RATIO = 0.05
 MIN_MAJORITY_RATIO = 0.18
-
-# -----------------------------
-# Debug Hough / parallel-line overlay
-# This is only for visualization.
-# -----------------------------
-DEBUG_SHOW_PARALLEL_LINES = True
-DEBUG_CANNY_LOW = 50
-DEBUG_CANNY_HIGH = 150
-DEBUG_HOUGH_THRESHOLD = 45
-DEBUG_MIN_LINE_LENGTH = 100
-DEBUG_MAX_LINE_GAP = 20
-DEBUG_HORIZONTAL_TOLERANCE_DEG = 10.0
-DEBUG_MAX_PAIR_ANGLE_DIFF_DEG = 20.0
-DEBUG_MAX_LINE_DISTANCE_PX = 150.0
-DEBUG_MIN_HORIZONTAL_OVERLAP_PX = 40.0
-DEBUG_PAIR_PAD_X = 10
-DEBUG_PAIR_PAD_Y = 6
 
 # -----------------------------
 # Display / debugging
@@ -188,6 +185,10 @@ def longest_edge_angle_deg(box_points):
     return best_angle
 
 
+def line_length(x1, y1, x2, y2):
+    return float(np.hypot(x2 - x1, y2 - y1))
+
+
 def dominant_depth_from_mask(depth_image, mask):
     masked_pixels = depth_image[mask > 0]
     if masked_pixels.size == 0:
@@ -240,7 +241,7 @@ def depth_to_branch_color(depth_m):
     return (blue_value, 0, 0)
 
 
-def contour_score(candidate, image_width):
+def candidate_score(candidate, image_width):
     center_x = candidate["center"][0]
     center_bonus = 1.0 - abs(center_x - image_width / 2.0) / (image_width / 2.0)
     center_bonus = np.clip(center_bonus, 0.0, 1.0)
@@ -248,91 +249,50 @@ def contour_score(candidate, image_width):
     horizontal_bonus = 1.0 - candidate["horizontal_dev_deg"] / MAX_HORIZONTAL_DEVIATION_DEG
     horizontal_bonus = np.clip(horizontal_bonus, 0.0, 1.0)
 
-    aspect_bonus = np.clip(candidate["aspect_ratio"] / 10.0, 0.0, 1.0)
-    area_bonus = np.clip(candidate["area"] / 5000.0, 0.0, 1.0)
+    overlap_bonus = np.clip(candidate["overlap_px"] / 200.0, 0.0, 1.0)
+    span_bonus = np.clip(candidate["major_axis"] / 250.0, 0.0, 1.0)
 
     return (
         0.30 * center_bonus
         + 0.25 * horizontal_bonus
-        + 0.20 * aspect_bonus
+        + 0.20 * overlap_bonus
         + 0.15 * candidate["majority_ratio"]
-        + 0.10 * area_bonus
+        + 0.10 * span_bonus
     )
 
 
-def detect_debug_parallel_pairs(color_image):
-    gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, DEBUG_CANNY_LOW, DEBUG_CANNY_HIGH)
+def bbox_iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
 
-    lines = cv2.HoughLinesP(
-        edges,
-        1,
-        np.pi / 180.0,
-        threshold=DEBUG_HOUGH_THRESHOLD,
-        minLineLength=DEBUG_MIN_LINE_LENGTH,
-        maxLineGap=DEBUG_MAX_LINE_GAP,
-    )
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
 
-    if lines is None:
-        return [], [], edges
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    intersection = inter_w * inter_h
 
-    line_segments = [tuple(line[0]) for line in lines]
-    line_angles = [
-        line_angle_degrees(x1, y1, x2, y2)
-        for x1, y1, x2, y2 in line_segments
-    ]
-    line_midpoints = [
-        line_midpoint(x1, y1, x2, y2)
-        for x1, y1, x2, y2 in line_segments
-    ]
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - intersection
 
-    qualifying_line_indexes = set()
-    pair_regions = []
+    if union <= 0:
+        return 0.0
 
-    for i in range(len(line_segments)):
-        if horizontal_deviation_degrees(line_angles[i]) > DEBUG_HORIZONTAL_TOLERANCE_DEG:
+    return intersection / union
+
+
+def suppress_overlapping_candidates(candidates, iou_threshold=0.45):
+    kept = []
+
+    for candidate in sorted(candidates, key=lambda c: c["score"], reverse=True):
+        if any(bbox_iou(candidate["bbox"], existing["bbox"]) > iou_threshold for existing in kept):
             continue
+        kept.append(candidate)
 
-        for j in range(i + 1, len(line_segments)):
-            if horizontal_deviation_degrees(line_angles[j]) > DEBUG_HORIZONTAL_TOLERANCE_DEG:
-                continue
-
-            angle_diff = angle_difference_degrees(line_angles[i], line_angles[j])
-            if angle_diff > DEBUG_MAX_PAIR_ANGLE_DIFF_DEG:
-                continue
-
-            midpoint_distance = np.hypot(
-                line_midpoints[i][0] - line_midpoints[j][0],
-                line_midpoints[i][1] - line_midpoints[j][1],
-            )
-            if midpoint_distance > DEBUG_MAX_LINE_DISTANCE_PX:
-                continue
-
-            overlap_px = horizontal_overlap(line_segments[i], line_segments[j])
-            if overlap_px < DEBUG_MIN_HORIZONTAL_OVERLAP_PX:
-                continue
-
-            qualifying_line_indexes.add(i)
-            qualifying_line_indexes.add(j)
-
-            ax1, ay1, ax2, ay2 = line_segments[i]
-            bx1, by1, bx2, by2 = line_segments[j]
-
-            region = clamp_bbox(
-                (
-                    min(ax1, ax2, bx1, bx2) - DEBUG_PAIR_PAD_X,
-                    min(ay1, ay2, by1, by2) - DEBUG_PAIR_PAD_Y,
-                    max(ax1, ax2, bx1, bx2) + DEBUG_PAIR_PAD_X,
-                    max(ay1, ay2, by1, by2) + DEBUG_PAIR_PAD_Y,
-                ),
-                color_image.shape[1],
-                color_image.shape[0],
-            )
-            pair_regions.append(region)
-
-    debug_lines = [line_segments[i] for i in qualifying_line_indexes]
-    return debug_lines, pair_regions, edges
+    return kept
 
 
 def detect_branch_candidates(color_image, depth_image):
@@ -358,110 +318,175 @@ def detect_branch_candidates(color_image, depth_image):
     binary = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_kernel)
 
-    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     candidates = []
     reject_reasons = {
-        "area": 0, "hull": 0, "solidity": 0, "minor_axis": 0,
-        "major_axis": 0, "aspect": 0, "fill": 0, "angle": 0,
+        "no_lines": 0, "short_line": 0, "angle": 0, "pair_angle": 0,
+        "pair_distance": 0, "pair_separation": 0, "pair_overlap": 0,
+        "pair_area": 0, "minor_axis": 0, "major_axis": 0, "aspect": 0,
         "depth_none": 0, "valid_ratio": 0, "majority_ratio": 0,
         "depth_range": 0,
     }
 
-    for contour in contours:
-        area = cv2.contourArea(contour)
-        if area < MIN_CONTOUR_AREA:
-            reject_reasons["area"] += 1
+    lines = cv2.HoughLinesP(
+        binary,
+        1,
+        np.pi / 180.0,
+        threshold=HOUGH_THRESHOLD,
+        minLineLength=HOUGH_MIN_LINE_LENGTH,
+        maxLineGap=HOUGH_MAX_LINE_GAP,
+    )
+    if lines is None:
+        reject_reasons["no_lines"] += 1
+        return candidates, binary, reject_reasons
+
+    filtered_lines = []
+    for line in lines:
+        x1, y1, x2, y2 = map(int, line[0])
+        length_px = line_length(x1, y1, x2, y2)
+        if length_px < MIN_MAJOR_AXIS_PX:
+            reject_reasons["short_line"] += 1
             continue
 
-        hull = cv2.convexHull(contour)
-        hull_area = cv2.contourArea(hull)
-        if hull_area <= 0:
-            reject_reasons["hull"] += 1
-            continue
-
-        solidity = area / hull_area
-        if solidity < MIN_SOLIDITY:
-            reject_reasons["solidity"] += 1
-            continue
-
-        rect = cv2.minAreaRect(contour)
-        (cx, cy), (w, h), _ = rect
-
-        major_axis = max(w, h)
-        minor_axis = min(w, h)
-
-        if minor_axis <= 0:
-            reject_reasons["minor_axis"] += 1
-            continue
-        if major_axis < MIN_MAJOR_AXIS_PX:
-            reject_reasons["major_axis"] += 1
-            continue
-
-        aspect_ratio = major_axis / minor_axis
-        if aspect_ratio < MIN_ASPECT_RATIO:
-            reject_reasons["aspect"] += 1
-            continue
-
-        rect_area = max(major_axis * minor_axis, 1.0)
-        fill_ratio = area / rect_area
-        if fill_ratio < MIN_FILL_RATIO or fill_ratio > MAX_FILL_RATIO:
-            reject_reasons["fill"] += 1
-            continue
-
-        box = cv2.boxPoints(rect)
-        box = np.int32(box)
-
-        horizontal_angle = longest_edge_angle_deg(box)
-        horizontal_dev = horizontal_deviation_degrees(horizontal_angle)
+        angle = line_angle_degrees(x1, y1, x2, y2)
+        horizontal_dev = horizontal_deviation_degrees(angle)
         if horizontal_dev > MAX_HORIZONTAL_DEVIATION_DEG:
             reject_reasons["angle"] += 1
             continue
 
-        # Depth vote on a shrunken contour mask so nearby clutter contributes less.
-        mask = np.zeros((top_limit, image_w), dtype=np.uint8)
-        cv2.drawContours(mask, [contour], -1, 255, thickness=-1)
-        mask = cv2.erode(mask, erode_kernel, iterations=1)
+        filtered_lines.append(
+            {
+                "segment": (x1, y1, x2, y2),
+                "angle_deg": angle,
+                "horizontal_dev_deg": horizontal_dev,
+                "midpoint": line_midpoint(x1, y1, x2, y2),
+                "length_px": length_px,
+            }
+        )
 
-        full_mask = np.zeros(depth_image.shape, dtype=np.uint8)
-        full_mask[:top_limit, :] = mask
+    for i in range(len(filtered_lines)):
+        line_a = filtered_lines[i]
+        ax1, ay1, ax2, ay2 = line_a["segment"]
 
-        depth_vote = dominant_depth_from_mask(depth_image, full_mask)
-        if depth_vote is None:
-            reject_reasons["depth_none"] += 1
-            continue
+        for j in range(i + 1, len(filtered_lines)):
+            line_b = filtered_lines[j]
+            bx1, by1, bx2, by2 = line_b["segment"]
 
-        if depth_vote["valid_ratio"] < MIN_VALID_DEPTH_RATIO:
-            reject_reasons["valid_ratio"] += 1
-            continue
-        if depth_vote["majority_ratio"] < MIN_MAJORITY_RATIO:
-            reject_reasons["majority_ratio"] += 1
-            continue
+            angle_diff = angle_difference_degrees(line_a["angle_deg"], line_b["angle_deg"])
+            if angle_diff > MAX_PAIR_ANGLE_DIFF_DEG:
+                reject_reasons["pair_angle"] += 1
+                continue
 
-        depth_m = depth_vote["depth_m"]
-        if not (MIN_DEPTH_M <= depth_m <= MAX_DEPTH_M):
-            reject_reasons["depth_range"] += 1
-            continue
+            midpoint_distance = np.hypot(
+                line_a["midpoint"][0] - line_b["midpoint"][0],
+                line_a["midpoint"][1] - line_b["midpoint"][1],
+            )
+            if midpoint_distance > MAX_PAIR_DISTANCE_PX:
+                reject_reasons["pair_distance"] += 1
+                continue
 
-        candidate = {
-            "contour": contour,
-            "box": box,
-            "center": (float(cx), float(cy)),
-            "area": float(area),
-            "major_axis": float(major_axis),
-            "minor_axis": float(minor_axis),
-            "aspect_ratio": float(aspect_ratio),
-            "solidity": float(solidity),
-            "fill_ratio": float(fill_ratio),
-            "horizontal_dev_deg": float(horizontal_dev),
-            "depth_m": depth_m,
-            "valid_ratio": depth_vote["valid_ratio"],
-            "majority_ratio": depth_vote["majority_ratio"],
-            "mask": full_mask,
-        }
-        candidate["score"] = contour_score(candidate, image_w)
-        candidates.append(candidate)
+            vertical_separation = abs(line_a["midpoint"][1] - line_b["midpoint"][1])
+            if vertical_separation < MIN_PAIR_VERTICAL_SEPARATION_PX:
+                reject_reasons["pair_separation"] += 1
+                continue
 
+            overlap_px = horizontal_overlap(line_a["segment"], line_b["segment"])
+            if overlap_px < MIN_HORIZONTAL_OVERLAP_PX:
+                reject_reasons["pair_overlap"] += 1
+                continue
+
+            pair_points = np.array(
+                [(ax1, ay1), (ax2, ay2), (bx1, by1), (bx2, by2)],
+                dtype=np.int32,
+            )
+            pair_hull = cv2.convexHull(pair_points)
+            area = cv2.contourArea(pair_hull)
+            if area < MIN_PAIR_AREA:
+                reject_reasons["pair_area"] += 1
+                continue
+
+            rect = cv2.minAreaRect(pair_hull)
+            (cx, cy), (w, h), _ = rect
+            major_axis = max(w, h)
+            minor_axis = min(w, h)
+
+            if minor_axis <= 0:
+                reject_reasons["minor_axis"] += 1
+                continue
+            if major_axis < MIN_MAJOR_AXIS_PX:
+                reject_reasons["major_axis"] += 1
+                continue
+
+            aspect_ratio = major_axis / minor_axis
+            if aspect_ratio < MIN_ASPECT_RATIO:
+                reject_reasons["aspect"] += 1
+                continue
+
+            box = cv2.boxPoints(rect)
+            box = np.int32(box)
+
+            horizontal_angle = longest_edge_angle_deg(box)
+            horizontal_dev = horizontal_deviation_degrees(horizontal_angle)
+            if horizontal_dev > MAX_HORIZONTAL_DEVIATION_DEG:
+                reject_reasons["angle"] += 1
+                continue
+
+            mask = np.zeros((top_limit, image_w), dtype=np.uint8)
+            cv2.fillConvexPoly(mask, pair_hull.reshape(-1, 2), 255)
+            mask = cv2.erode(mask, erode_kernel, iterations=1)
+
+            full_mask = np.zeros(depth_image.shape, dtype=np.uint8)
+            full_mask[:top_limit, :] = mask
+
+            depth_vote = dominant_depth_from_mask(depth_image, full_mask)
+            if depth_vote is None:
+                reject_reasons["depth_none"] += 1
+                continue
+
+            if depth_vote["valid_ratio"] < MIN_VALID_DEPTH_RATIO:
+                reject_reasons["valid_ratio"] += 1
+                continue
+            if depth_vote["majority_ratio"] < MIN_MAJORITY_RATIO:
+                reject_reasons["majority_ratio"] += 1
+                continue
+
+            depth_m = depth_vote["depth_m"]
+            if not (MIN_DEPTH_M <= depth_m <= MAX_DEPTH_M):
+                reject_reasons["depth_range"] += 1
+                continue
+
+            bbox = clamp_bbox(
+                (
+                    min(ax1, ax2, bx1, bx2) - PAIR_PAD_X,
+                    min(ay1, ay2, by1, by2) - PAIR_PAD_Y,
+                    max(ax1, ax2, bx1, bx2) + PAIR_PAD_X,
+                    max(ay1, ay2, by1, by2) + PAIR_PAD_Y,
+                ),
+                image_w,
+                image_h,
+            )
+
+            candidate = {
+                "lines": (line_a["segment"], line_b["segment"]),
+                "box": box,
+                "bbox": bbox,
+                "center": (float(cx), float(cy)),
+                "area": float(area),
+                "major_axis": float(major_axis),
+                "minor_axis": float(minor_axis),
+                "aspect_ratio": float(aspect_ratio),
+                "horizontal_dev_deg": float(horizontal_dev),
+                "overlap_px": float(overlap_px),
+                "midpoint_distance_px": float(midpoint_distance),
+                "vertical_separation_px": float(vertical_separation),
+                "depth_m": depth_m,
+                "valid_ratio": depth_vote["valid_ratio"],
+                "majority_ratio": depth_vote["majority_ratio"],
+                "mask": full_mask,
+            }
+            candidate["score"] = candidate_score(candidate, image_w)
+            candidates.append(candidate)
+
+    candidates = suppress_overlapping_candidates(candidates)
     return candidates, binary, reject_reasons
 
 
@@ -541,21 +566,7 @@ try:
             cv2.line(display_image, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 0), 2)
             cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
 
-        # Debug parallel-line overlay across the full frame.
-        if DEBUG_SHOW_PARALLEL_LINES:
-            debug_lines, debug_regions, debug_edges = detect_debug_parallel_pairs(color_image)
-
-            for line in debug_lines:
-                x1, y1, x2, y2 = line
-                cv2.line(display_image, (x1, y1), (x2, y2), YELLOW, 2)
-
-            for region in debug_regions:
-                x1, y1, x2, y2 = region
-                cv2.rectangle(display_image, (x1, y1), (x2, y2), YELLOW, 1)
-        else:
-            debug_edges = np.zeros((COLOR_HEIGHT, COLOR_WIDTH), dtype=np.uint8)
-
-        # Main contour-based detector in top third.
+        # Main Hough-line detector in top third.
         candidates, binary, reject_reasons = detect_branch_candidates(color_image, depth_image)
 
         active_rejects = {k: v for k, v in reject_reasons.items() if v > 0}
@@ -564,8 +575,11 @@ try:
 
         best_candidate = max(candidates, key=lambda c: c["score"]) if candidates else None
 
-        # Draw all accepted contour regions in yellow first.
+        # Draw all accepted line pairs in yellow first.
         for candidate in candidates:
+            for line in candidate["lines"]:
+                x1, y1, x2, y2 = line
+                cv2.line(display_image, (x1, y1), (x2, y2), YELLOW, 1)
             cv2.polylines(display_image, [candidate["box"]], True, YELLOW, 2)
 
         # Draw final accepted branch candidates with distance color.
@@ -593,7 +607,7 @@ try:
 
         cv2.putText(
             display_image,
-            f"Contour candidates: {len(candidates)}",
+            f"Line-pair candidates: {len(candidates)}",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -602,17 +616,8 @@ try:
         )
         cv2.putText(
             display_image,
-            f"Debug parallel lines: {len(debug_lines) if DEBUG_SHOW_PARALLEL_LINES else 0}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            YELLOW,
-            2,
-        )
-        cv2.putText(
-            display_image,
             f"Close enough (green): {close_count}",
-            (10, 90),
+            (10, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             (0, 255, 0),
@@ -623,7 +628,7 @@ try:
             cv2.putText(
                 display_image,
                 f"Best depth: {best_candidate['depth_m']:.2f} m",
-                (10, 120),
+                (10, 90),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 depth_to_branch_color(best_candidate["depth_m"]),
@@ -631,8 +636,8 @@ try:
             )
             cv2.putText(
                 display_image,
-                f"Aspect: {best_candidate['aspect_ratio']:.1f}  Solidity: {best_candidate['solidity']:.2f}",
-                (10, 150),
+                f"Aspect: {best_candidate['aspect_ratio']:.1f}  Overlap: {best_candidate['overlap_px']:.0f}px",
+                (10, 120),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
                 (255, 255, 255),
@@ -651,24 +656,29 @@ try:
 
         if DRAW_BINARY_VIEW:
             binary_bgr = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
-            debug_edges_bgr = cv2.cvtColor(debug_edges, cv2.COLOR_GRAY2BGR)
-
             binary_bgr = cv2.resize(binary_bgr, (COLOR_WIDTH, COLOR_HEIGHT))
-            debug_edges_bgr = cv2.resize(debug_edges_bgr, (COLOR_WIDTH, COLOR_HEIGHT))
-
-            cv2.putText(binary_bgr, "Contour Binary", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, YELLOW, 2)
-            cv2.putText(debug_edges_bgr, "Debug Hough Edges", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, YELLOW, 2)
+            diagnostic_panel = np.zeros((COLOR_HEIGHT, COLOR_WIDTH * 2, 3), dtype=np.uint8)
+            diagnostic_panel[:, :COLOR_WIDTH] = binary_bgr
+            cv2.putText(
+                diagnostic_panel,
+                "Hough Binary",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                YELLOW,
+                2,
+            )
 
             combined = np.vstack(
                 (
                     np.hstack((display_image, depth_colormap)),
-                    np.hstack((binary_bgr, debug_edges_bgr)),
+                    diagnostic_panel,
                 )
             )
         else:
             combined = np.hstack((display_image, depth_colormap))
 
-        cv2.imshow("D435 Contour Branch Detection + Debug", combined)
+        cv2.imshow("D435 Hough Line Branch Detection", combined)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
