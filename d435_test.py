@@ -1,12 +1,14 @@
 import cv2
 import numpy as np
 
+from param_gui import ParamGUI
+
 try:
     import pyrealsense2 as rs
 except ImportError as exc:
     raise ImportError(
         "This script requires `pyrealsense2` for the Intel RealSense D435 camera. "
-        "Install dependencies with: pip install numpy opencv-python pyrealsense2"
+        "Install dependencies with: pip install numpy opencv-python pyrealsense2 pyyaml"
     ) from exc
 
 #Test push
@@ -106,284 +108,6 @@ TOP_REGION_COLOR = (255, 255, 0)
 BOX_RED = (0, 0, 255)
 BOX_GREEN = (0, 255, 0)
 MAIN_WINDOW_NAME = "D435 Hough Line Branch Detection"
-CANNY_CONTROL_WINDOW_NAME = "Canny Controls"
-CONTROL_WINDOW_NAME = "Raw Hough Controls"
-DEPTH_CONTROL_WINDOW_NAME = "Depth Controls"
-CAMERA_CONTROL_WINDOW_NAME = "Camera Controls"
-
-
-def _noop(_value):
-    pass
-
-
-def render_label_panel(title, rows, width=520, row_height=34):
-    height = 50 + row_height * len(rows)
-    panel = np.zeros((height, width, 3), dtype=np.uint8)
-
-    cv2.putText(
-        panel,
-        title,
-        (12, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (255, 255, 255),
-        2,
-    )
-
-    for index, (label, value) in enumerate(rows):
-        y = 55 + index * row_height
-        cv2.putText(
-            panel,
-            f"{label}: {value}",
-            (12, y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.58,
-            (220, 220, 220),
-            1,
-        )
-
-    return panel
-
-
-def format_slider_value(value):
-    if isinstance(value, float):
-        return f"{value:.2f}"
-    return str(value)
-
-
-def render_control_window(window_name, title, rows, width=520, row_height=34):
-    panel = render_label_panel(
-        title,
-        [(label, format_slider_value(value)) for label, value in rows],
-        width=width,
-        row_height=row_height,
-    )
-    cv2.imshow(window_name, panel)
-
-
-def create_canny_trackbars():
-    cv2.namedWindow(CANNY_CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CANNY_CONTROL_WINDOW_NAME, 520, 220)
-    cv2.createTrackbar("Canny Low", CANNY_CONTROL_WINDOW_NAME, CANNY_LOW, 255, _noop)
-    cv2.createTrackbar("Canny High", CANNY_CONTROL_WINDOW_NAME, CANNY_HIGH, 255, _noop)
-    cv2.createTrackbar(
-        "CLAHE x10",
-        CANNY_CONTROL_WINDOW_NAME,
-        int(round(CLAHE_CLIP_LIMIT * 10.0)),
-        100,
-        _noop,
-    )
-
-
-def get_canny_runtime_params():
-    canny_low = cv2.getTrackbarPos("Canny Low", CANNY_CONTROL_WINDOW_NAME)
-    canny_high = cv2.getTrackbarPos("Canny High", CANNY_CONTROL_WINDOW_NAME)
-    clahe_clip_x10 = cv2.getTrackbarPos("CLAHE x10", CANNY_CONTROL_WINDOW_NAME)
-
-    canny_low = int(np.clip(canny_low, 0, 254))
-    canny_high = int(np.clip(max(canny_high, canny_low + 1), 1, 255))
-    clahe_clip_limit = max(0.1, clahe_clip_x10 / 10.0)
-
-    return {
-        "canny_low": canny_low,
-        "canny_high": canny_high,
-        "clahe_clip_limit": clahe_clip_limit,
-    }
-
-
-def create_raw_hough_trackbars():
-    cv2.namedWindow(CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CONTROL_WINDOW_NAME, 520, 240)
-    cv2.createTrackbar("Hough Thresh", CONTROL_WINDOW_NAME, HOUGH_THRESHOLD, 300, _noop)
-    cv2.createTrackbar(
-        "Min Line Len", CONTROL_WINDOW_NAME, HOUGH_MIN_LINE_LENGTH, 400, _noop
-    )
-    cv2.createTrackbar(
-        "Gap Ref Px",
-        CONTROL_WINDOW_NAME,
-        HOUGH_LINE_CONNECT_GAP_REFERENCE_PX,
-        200,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Gap Min Px",
-        CONTROL_WINDOW_NAME,
-        HOUGH_LINE_CONNECT_GAP_MIN_PX,
-        200,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Gap Max Px",
-        CONTROL_WINDOW_NAME,
-        HOUGH_LINE_CONNECT_GAP_MAX_PX,
-        300,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Pair Min x10 in",
-        CONTROL_WINDOW_NAME,
-        int(round(MIN_PAIR_GAP_M * 39.3701 * 10.0)),
-        100,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Pair Max x10 in",
-        CONTROL_WINDOW_NAME,
-        int(round(MAX_PAIR_GAP_M * 39.3701 * 10.0)),
-        200,
-        _noop,
-    )
-
-
-def get_raw_hough_runtime_params():
-    hough_threshold = cv2.getTrackbarPos("Hough Thresh", CONTROL_WINDOW_NAME)
-    hough_min_line_length = cv2.getTrackbarPos("Min Line Len", CONTROL_WINDOW_NAME)
-    gap_ref_px = cv2.getTrackbarPos("Gap Ref Px", CONTROL_WINDOW_NAME)
-    gap_min_px = cv2.getTrackbarPos("Gap Min Px", CONTROL_WINDOW_NAME)
-    gap_max_px = cv2.getTrackbarPos("Gap Max Px", CONTROL_WINDOW_NAME)
-    pair_min_tenth_in = cv2.getTrackbarPos("Pair Min x10 in", CONTROL_WINDOW_NAME)
-    pair_max_tenth_in = cv2.getTrackbarPos("Pair Max x10 in", CONTROL_WINDOW_NAME)
-
-    hough_threshold = max(1, hough_threshold)
-    hough_min_line_length = max(1, hough_min_line_length)
-    gap_ref_px = max(1, gap_ref_px)
-    gap_min_px = max(1, gap_min_px)
-    gap_max_px = max(gap_min_px, gap_max_px)
-    pair_min_gap_m = max(0.0, pair_min_tenth_in / 10.0 / 39.3701)
-    pair_max_gap_m = max(pair_min_gap_m, pair_max_tenth_in / 10.0 / 39.3701)
-
-    return {
-        "hough_threshold": hough_threshold,
-        "hough_min_line_length": hough_min_line_length,
-        "gap_ref_px": gap_ref_px,
-        "gap_min_px": gap_min_px,
-        "gap_max_px": gap_max_px,
-        "pair_min_gap_m": pair_min_gap_m,
-        "pair_max_gap_m": pair_max_gap_m,
-    }
-
-
-def create_depth_trackbars():
-    cv2.namedWindow(DEPTH_CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(DEPTH_CONTROL_WINDOW_NAME, 520, 280)
-    cv2.createTrackbar(
-        "Min Depth cm",
-        DEPTH_CONTROL_WINDOW_NAME,
-        int(round(MIN_DEPTH_M * 100.0)),
-        500,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Max Depth cm",
-        DEPTH_CONTROL_WINDOW_NAME,
-        int(round(MAX_DEPTH_M * 100.0)),
-        500,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Green cm",
-        DEPTH_CONTROL_WINDOW_NAME,
-        int(round(GREEN_THRESHOLD_M * 100.0)),
-        500,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Depth Bin mm",
-        DEPTH_CONTROL_WINDOW_NAME,
-        DEPTH_BIN_MM,
-        100,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Min Valid %",
-        DEPTH_CONTROL_WINDOW_NAME,
-        int(round(MIN_VALID_DEPTH_RATIO * 100.0)),
-        100,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Min Majority %",
-        DEPTH_CONTROL_WINDOW_NAME,
-        int(round(MIN_MAJORITY_RATIO * 100.0)),
-        100,
-        _noop,
-    )
-    cv2.createTrackbar(
-        "Max Background %",
-        DEPTH_CONTROL_WINDOW_NAME,
-        int(round(MAX_BACKGROUND_RATIO * 100.0)),
-        100,
-        _noop,
-    )
-
-
-def get_depth_runtime_params():
-    min_depth_cm = cv2.getTrackbarPos("Min Depth cm", DEPTH_CONTROL_WINDOW_NAME)
-    max_depth_cm = cv2.getTrackbarPos("Max Depth cm", DEPTH_CONTROL_WINDOW_NAME)
-    green_cm = cv2.getTrackbarPos("Green cm", DEPTH_CONTROL_WINDOW_NAME)
-    depth_bin_mm = cv2.getTrackbarPos("Depth Bin mm", DEPTH_CONTROL_WINDOW_NAME)
-    min_valid_percent = cv2.getTrackbarPos("Min Valid %", DEPTH_CONTROL_WINDOW_NAME)
-    min_majority_percent = cv2.getTrackbarPos("Min Majority %", DEPTH_CONTROL_WINDOW_NAME)
-    max_background_percent = cv2.getTrackbarPos("Max Background %", DEPTH_CONTROL_WINDOW_NAME)
-
-    min_depth_m = max(0.01, min_depth_cm / 100.0)
-    max_depth_m = max(min_depth_m + 0.01, max_depth_cm / 100.0)
-    green_threshold_m = np.clip(green_cm / 100.0, min_depth_m, max_depth_m)
-    depth_bin_mm = max(1, depth_bin_mm)
-
-    return {
-        "min_depth_m": float(min_depth_m),
-        "max_depth_m": float(max_depth_m),
-        "green_threshold_m": float(green_threshold_m),
-        "min_depth_mm": int(round(min_depth_m * 1000.0)),
-        "max_depth_mm": int(round(max_depth_m * 1000.0)),
-        "depth_bin_mm": int(depth_bin_mm),
-        "min_valid_ratio": float(np.clip(min_valid_percent / 100.0, 0.0, 1.0)),
-        "min_majority_ratio": float(np.clip(min_majority_percent / 100.0, 0.0, 1.0)),
-        "max_background_ratio": float(np.clip(max_background_percent / 100.0, 0.0, 1.0)),
-    }
-
-
-def create_camera_trackbars():
-    cv2.namedWindow(CAMERA_CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CAMERA_CONTROL_WINDOW_NAME, 560, 420)
-    cv2.createTrackbar("Visual Preset", CAMERA_CONTROL_WINDOW_NAME, 4, 5, _noop)
-    cv2.createTrackbar("Emitter", CAMERA_CONTROL_WINDOW_NAME, 1, 1, _noop)
-    cv2.createTrackbar("Laser Power", CAMERA_CONTROL_WINDOW_NAME, 180, 360, _noop)
-    cv2.createTrackbar("Auto Exposure", CAMERA_CONTROL_WINDOW_NAME, 1, 1, _noop)
-    cv2.createTrackbar("Exposure", CAMERA_CONTROL_WINDOW_NAME, 8500, 20000, _noop)
-    cv2.createTrackbar("Gain", CAMERA_CONTROL_WINDOW_NAME, 16, 128, _noop)
-    cv2.createTrackbar("Spatial Mag", CAMERA_CONTROL_WINDOW_NAME, 1, 5, _noop)
-    cv2.createTrackbar("Spatial A x100", CAMERA_CONTROL_WINDOW_NAME, 35, 100, _noop)
-    cv2.createTrackbar("Spatial Delta", CAMERA_CONTROL_WINDOW_NAME, 30, 100, _noop)
-    cv2.createTrackbar("Temporal A x100", CAMERA_CONTROL_WINDOW_NAME, 25, 100, _noop)
-    cv2.createTrackbar("Temporal Delta", CAMERA_CONTROL_WINDOW_NAME, 30, 100, _noop)
-
-
-def get_camera_runtime_params():
-    return {
-        "visual_preset": cv2.getTrackbarPos("Visual Preset", CAMERA_CONTROL_WINDOW_NAME),
-        "emitter_enabled": cv2.getTrackbarPos("Emitter", CAMERA_CONTROL_WINDOW_NAME),
-        "laser_power": cv2.getTrackbarPos("Laser Power", CAMERA_CONTROL_WINDOW_NAME),
-        "auto_exposure": cv2.getTrackbarPos("Auto Exposure", CAMERA_CONTROL_WINDOW_NAME),
-        "exposure": max(1, cv2.getTrackbarPos("Exposure", CAMERA_CONTROL_WINDOW_NAME)),
-        "gain": max(1, cv2.getTrackbarPos("Gain", CAMERA_CONTROL_WINDOW_NAME)),
-        "spatial_magnitude": max(
-            1, cv2.getTrackbarPos("Spatial Mag", CAMERA_CONTROL_WINDOW_NAME)
-        ),
-        "spatial_alpha": max(
-            0.01, cv2.getTrackbarPos("Spatial A x100", CAMERA_CONTROL_WINDOW_NAME) / 100.0
-        ),
-        "spatial_delta": max(
-            1, cv2.getTrackbarPos("Spatial Delta", CAMERA_CONTROL_WINDOW_NAME)
-        ),
-        "temporal_alpha": max(
-            0.01, cv2.getTrackbarPos("Temporal A x100", CAMERA_CONTROL_WINDOW_NAME) / 100.0
-        ),
-        "temporal_delta": max(
-            1, cv2.getTrackbarPos("Temporal Delta", CAMERA_CONTROL_WINDOW_NAME)
-        ),
-    }
 
 
 def safe_set_option(sensor_or_filter, option, value):
@@ -1037,10 +761,7 @@ temporal = rs.temporal_filter()
 temporal.set_option(rs.option.filter_smooth_alpha, 0.25)
 temporal.set_option(rs.option.filter_smooth_delta, 30)
 
-create_canny_trackbars()
-create_raw_hough_trackbars()
-create_depth_trackbars()
-create_camera_trackbars()
+gui = ParamGUI("params.yaml")
 last_camera_settings = {}
 print("Press 'q' to quit.")
 
@@ -1075,11 +796,8 @@ try:
         else:
             depth_image = depth_raw
 
-        canny_params = get_canny_runtime_params()
-        hough_params = get_raw_hough_runtime_params()
-        depth_params = get_depth_runtime_params()
-        camera_params = get_camera_runtime_params()
-        runtime_params = {**canny_params, **hough_params, **depth_params, **camera_params}
+        gui.update()
+        runtime_params = gui.get_all_params()
 
         apply_camera_runtime_params(
             depth_sensor,
@@ -1342,81 +1060,13 @@ try:
         )
 
         cv2.imshow(MAIN_WINDOW_NAME, combined)
-        render_control_window(
-            CANNY_CONTROL_WINDOW_NAME,
-            "Canny Controls",
-            [
-                ("Canny Low", runtime_params["canny_low"]),
-                ("Canny High", runtime_params["canny_high"]),
-                ("CLAHE x10", int(round(runtime_params["clahe_clip_limit"] * 10.0))),
-            ],
-            width=520,
-            row_height=42,
-        )
-        render_control_window(
-            CONTROL_WINDOW_NAME,
-            "Raw Hough Controls",
-            [
-                ("Hough Threshold", runtime_params["hough_threshold"]),
-                ("Min Line Len", runtime_params["hough_min_line_length"]),
-                ("Gap Ref Px", runtime_params["gap_ref_px"]),
-                ("Gap Min Px", runtime_params["gap_min_px"]),
-                ("Gap Max Px", runtime_params["gap_max_px"]),
-                (
-                    "Pair Min in",
-                    round(runtime_params["pair_min_gap_m"] * 39.3701, 1),
-                ),
-                (
-                    "Pair Max in",
-                    round(runtime_params["pair_max_gap_m"] * 39.3701, 1),
-                ),
-            ],
-            width=520,
-            row_height=32,
-        )
-        render_control_window(
-            DEPTH_CONTROL_WINDOW_NAME,
-            "Depth Controls",
-            [
-                ("Min Depth cm", int(round(runtime_params["min_depth_m"] * 100.0))),
-                ("Max Depth cm", int(round(runtime_params["max_depth_m"] * 100.0))),
-                ("Green cm", int(round(runtime_params["green_threshold_m"] * 100.0))),
-                ("Depth Bin mm", runtime_params["depth_bin_mm"]),
-                ("Min Valid %", int(round(runtime_params["min_valid_ratio"] * 100.0))),
-                ("Min Majority %", int(round(runtime_params["min_majority_ratio"] * 100.0))),
-                (
-                    "Max Background %",
-                    int(round(runtime_params["max_background_ratio"] * 100.0)),
-                ),
-            ],
-            width=520,
-            row_height=34,
-        )
-        render_control_window(
-            CAMERA_CONTROL_WINDOW_NAME,
-            "Camera Controls",
-            [
-                ("Visual Preset", runtime_params["visual_preset"]),
-                ("Emitter", runtime_params["emitter_enabled"]),
-                ("Laser Power", runtime_params["laser_power"]),
-                ("Auto Exposure", runtime_params["auto_exposure"]),
-                ("Exposure", runtime_params["exposure"]),
-                ("Gain", runtime_params["gain"]),
-                ("Spatial Mag", runtime_params["spatial_magnitude"]),
-                ("Spatial Alpha", runtime_params["spatial_alpha"]),
-                ("Spatial Delta", runtime_params["spatial_delta"]),
-                ("Temporal Alpha", runtime_params["temporal_alpha"]),
-                ("Temporal Delta", runtime_params["temporal_delta"]),
-            ],
-            width=560,
-            row_height=32,
-        )
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
 finally:
     pipeline.stop()
+    gui.root.destroy()
     cv2.destroyAllWindows()
 
 
