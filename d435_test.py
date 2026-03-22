@@ -104,14 +104,48 @@ BOX_GREEN = (0, 255, 0)
 MAIN_WINDOW_NAME = "D435 Hough Line Branch Detection"
 CONTROL_WINDOW_NAME = "Raw Hough Controls"
 DEPTH_CONTROL_WINDOW_NAME = "Depth Controls"
+CONTROL_LABEL_WINDOW_NAME = "Raw Hough Labels"
+DEPTH_LABEL_WINDOW_NAME = "Depth Labels"
 
 
 def _noop(_value):
     pass
 
 
+def render_label_panel(title, rows, width=520, row_height=34):
+    height = 50 + row_height * len(rows)
+    panel = np.zeros((height, width, 3), dtype=np.uint8)
+
+    cv2.putText(
+        panel,
+        title,
+        (12, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2,
+    )
+
+    for index, (label, value) in enumerate(rows):
+        y = 55 + index * row_height
+        cv2.putText(
+            panel,
+            f"{label}: {value}",
+            (12, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (220, 220, 220),
+            1,
+        )
+
+    return panel
+
+
 def create_raw_hough_trackbars():
     cv2.namedWindow(CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(CONTROL_WINDOW_NAME, 520, 320)
+    cv2.namedWindow(CONTROL_LABEL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(CONTROL_LABEL_WINDOW_NAME, 520, 320)
     cv2.createTrackbar("Canny Low", CONTROL_WINDOW_NAME, CANNY_LOW, 255, _noop)
     cv2.createTrackbar("Canny High", CONTROL_WINDOW_NAME, CANNY_HIGH, 255, _noop)
     cv2.createTrackbar(
@@ -181,6 +215,9 @@ def get_raw_hough_runtime_params():
 
 def create_depth_trackbars():
     cv2.namedWindow(DEPTH_CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(DEPTH_CONTROL_WINDOW_NAME, 520, 280)
+    cv2.namedWindow(DEPTH_LABEL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(DEPTH_LABEL_WINDOW_NAME, 520, 280)
     cv2.createTrackbar(
         "Min Depth cm",
         DEPTH_CONTROL_WINDOW_NAME,
@@ -833,6 +870,36 @@ try:
         depth_params = get_depth_runtime_params()
         runtime_params = {**hough_params, **depth_params}
 
+        raw_hough_label_panel = render_label_panel(
+            "Raw Hough Controls",
+            [
+                ("Canny Low", runtime_params["canny_low"]),
+                ("Canny High", runtime_params["canny_high"]),
+                ("CLAHE x10", int(round(runtime_params["clahe_clip_limit"] * 10.0))),
+                ("Hough Threshold", runtime_params["hough_threshold"]),
+                ("Min Line Len", runtime_params["hough_min_line_length"]),
+                ("Gap Ref Px", runtime_params["gap_ref_px"]),
+                ("Gap Min Px", runtime_params["gap_min_px"]),
+                ("Gap Max Px", runtime_params["gap_max_px"]),
+            ],
+        )
+        depth_label_panel = render_label_panel(
+            "Depth Controls",
+            [
+                ("Min Depth cm", int(round(runtime_params["min_depth_m"] * 100.0))),
+                ("Max Depth cm", int(round(runtime_params["max_depth_m"] * 100.0))),
+                ("Green cm", int(round(runtime_params["green_threshold_m"] * 100.0))),
+                ("Depth Bin mm", runtime_params["depth_bin_mm"]),
+                ("Min Valid %", int(round(runtime_params["min_valid_ratio"] * 100.0))),
+                (
+                    "Min Majority %",
+                    int(round(runtime_params["min_majority_ratio"] * 100.0)),
+                ),
+            ],
+            width=520,
+            row_height=36,
+        )
+
         clipped = np.clip(
             depth_image,
             runtime_params["min_depth_mm"],
@@ -1021,6 +1088,8 @@ try:
         combined = np.hstack((display_image, depth_colormap, hough_debug_bgr))
 
         cv2.imshow(MAIN_WINDOW_NAME, combined)
+        cv2.imshow(CONTROL_LABEL_WINDOW_NAME, raw_hough_label_panel)
+        cv2.imshow(DEPTH_LABEL_WINDOW_NAME, depth_label_panel)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
