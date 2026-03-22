@@ -70,6 +70,7 @@ MASK_ERODE_KERNEL = (5, 3)
 # -----------------------------
 HOUGH_THRESHOLD = 131
 HOUGH_MIN_LINE_LENGTH = 142
+HOUGH_MIN_LINE_LENGTH_REFERENCE_DEPTH_M = 1.0
 HOUGH_LINE_CONNECT_GAP_REFERENCE_PX = 28
 HOUGH_LINE_CONNECT_GAP_REFERENCE_DEPTH_M = 1.0
 HOUGH_LINE_CONNECT_GAP_MIN_PX = 105
@@ -93,6 +94,8 @@ PAIR_PAD_Y = 6
 DEPTH_BIN_MM = 20
 MIN_VALID_DEPTH_RATIO = 0.05
 MIN_MAJORITY_RATIO = 0.18
+MAX_BACKGROUND_RATIO = 0.60
+BACKGROUND_DEPTH_TOLERANCE_BINS = 2.0
 
 # -----------------------------
 # Display / debugging
@@ -284,6 +287,13 @@ def create_depth_trackbars():
         100,
         _noop,
     )
+    cv2.createTrackbar(
+        "Max Background %",
+        DEPTH_CONTROL_WINDOW_NAME,
+        int(round(MAX_BACKGROUND_RATIO * 100.0)),
+        100,
+        _noop,
+    )
 
 
 def get_depth_runtime_params():
@@ -293,6 +303,7 @@ def get_depth_runtime_params():
     depth_bin_mm = cv2.getTrackbarPos("Depth Bin mm", DEPTH_CONTROL_WINDOW_NAME)
     min_valid_percent = cv2.getTrackbarPos("Min Valid %", DEPTH_CONTROL_WINDOW_NAME)
     min_majority_percent = cv2.getTrackbarPos("Min Majority %", DEPTH_CONTROL_WINDOW_NAME)
+    max_background_percent = cv2.getTrackbarPos("Max Background %", DEPTH_CONTROL_WINDOW_NAME)
 
     min_depth_m = max(0.01, min_depth_cm / 100.0)
     max_depth_m = max(min_depth_m + 0.01, max_depth_cm / 100.0)
@@ -308,6 +319,7 @@ def get_depth_runtime_params():
         "depth_bin_mm": int(depth_bin_mm),
         "min_valid_ratio": float(np.clip(min_valid_percent / 100.0, 0.0, 1.0)),
         "min_majority_ratio": float(np.clip(min_majority_percent / 100.0, 0.0, 1.0)),
+        "max_background_ratio": float(np.clip(max_background_percent / 100.0, 0.0, 1.0)),
     }
 
 
@@ -619,6 +631,41 @@ def build_hough_gap_schedule(focal_length_px, runtime_params):
     return sorted(set(gap_schedule))
 
 
+def build_hough_min_length_schedule(focal_length_px, runtime_params):
+    reference_length_m = estimate_length_m(
+        runtime_params["hough_min_line_length"],
+        HOUGH_MIN_LINE_LENGTH_REFERENCE_DEPTH_M,
+        focal_length_px,
+    )
+    if reference_length_m is None:
+        return [runtime_params["hough_min_line_length"]]
+
+    depth_samples_m = [
+        runtime_params["min_depth_m"],
+        runtime_params["green_threshold_m"],
+        0.35,
+        0.50,
+        0.75,
+        1.00,
+        runtime_params["max_depth_m"],
+    ]
+
+    min_length_schedule = []
+    for depth_m in depth_samples_m:
+        depth_m = float(
+            np.clip(depth_m, runtime_params["min_depth_m"], runtime_params["max_depth_m"])
+        )
+        min_length_px = estimate_pixels_for_length(reference_length_m, depth_m, focal_length_px)
+        if min_length_px is None:
+            continue
+
+        min_length_px = int(round(max(1, min_length_px)))
+        min_length_schedule.append(min_length_px)
+
+    min_length_schedule.append(runtime_params["hough_min_line_length"])
+    return sorted(set(min_length_schedule))
+
+
 def dominant_depth_from_mask(depth_image, mask, runtime_params):
     masked_pixels = depth_image[mask > 0]
     if masked_pixels.size == 0:
@@ -658,11 +705,23 @@ def dominant_depth_from_mask(depth_image, mask, runtime_params):
 
     majority_ratio = winning_depths.size / valid_depth.size
     dominant_depth_m = float(np.median(winning_depths)) / 1000.0
+    dominant_depth_mm = float(np.median(winning_depths))
+    coherence_tolerance_mm = max(
+        runtime_params["depth_bin_mm"] * BACKGROUND_DEPTH_TOLERANCE_BINS,
+        runtime_params["depth_bin_mm"],
+    )
+    coherent_pixels = masked_pixels[
+        (masked_pixels >= runtime_params["min_depth_mm"])
+        & (masked_pixels <= runtime_params["max_depth_mm"])
+        & (np.abs(masked_pixels.astype(np.float32) - dominant_depth_mm) <= coherence_tolerance_mm)
+    ]
+    background_ratio = 1.0 - (coherent_pixels.size / masked_pixels.size)
 
     return {
         "depth_m": dominant_depth_m,
         "valid_ratio": float(valid_ratio),
         "majority_ratio": float(majority_ratio),
+        "background_ratio": float(background_ratio),
     }
 
 
@@ -746,25 +805,30 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
     reject_reasons = {
         "no_lines": 0, "angle": 0, "duplicates": 0, "pair_angle": 0,
         "pair_gap": 0,
-        "minor_axis": 0, "length": 0,
+        "minor_axis": 0, "length": 0, "background": 0,
         "depth_none": 0, "valid_ratio": 0, "majority_ratio": 0,
         "depth_range": 0,
     }
 
     raw_hough_lines = []
-    for line_gap_px in build_hough_gap_schedule(focal_length_px, runtime_params):
-        lines = cv2.HoughLinesP(
-            edges,
-            1,
-            np.pi / 180.0,
-            threshold=runtime_params["hough_threshold"],
-            minLineLength=runtime_params["hough_min_line_length"],
-            maxLineGap=line_gap_px,
-        )
-        if lines is None:
-            continue
+    line_gap_schedule = build_hough_gap_schedule(focal_length_px, runtime_params)
+    min_line_length_schedule = build_hough_min_length_schedule(
+        focal_length_px, runtime_params
+    )
+    for line_gap_px in line_gap_schedule:
+        for min_line_length_px in min_line_length_schedule:
+            lines = cv2.HoughLinesP(
+                edges,
+                1,
+                np.pi / 180.0,
+                threshold=runtime_params["hough_threshold"],
+                minLineLength=min_line_length_px,
+                maxLineGap=line_gap_px,
+            )
+            if lines is None:
+                continue
 
-        raw_hough_lines.extend(tuple(map(int, line[0])) for line in lines)
+            raw_hough_lines.extend(tuple(map(int, line[0])) for line in lines)
 
     raw_hough_lines = list(dict.fromkeys(raw_hough_lines))
     if not raw_hough_lines:
@@ -830,6 +894,10 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
             depth_vote = dominant_depth_from_mask(depth_image, full_mask, runtime_params)
             if depth_vote is None:
                 reject_reasons["depth_none"] += 1
+                continue
+
+            if depth_vote["background_ratio"] > runtime_params["max_background_ratio"]:
+                reject_reasons["background"] += 1
                 continue
 
             if depth_vote["valid_ratio"] < runtime_params["min_valid_ratio"]:
@@ -898,6 +966,7 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
                 "estimated_length_m": float(estimated_length_m),
                 "valid_ratio": depth_vote["valid_ratio"],
                 "majority_ratio": depth_vote["majority_ratio"],
+                "background_ratio": depth_vote["background_ratio"],
                 "mask": full_mask,
             }
             candidate["score"] = candidate_score(candidate, image_w)
@@ -1109,6 +1178,18 @@ try:
                 (255, 255, 255),
                 2,
             )
+            width_text = "Width: n/a"
+            if best_candidate.get("pair_gap_m") is not None:
+                width_text = f"Width: {best_candidate['pair_gap_m'] * 39.3701:.1f} in"
+            cv2.putText(
+                display_image,
+                width_text,
+                (10, 150),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (255, 255, 255),
+                2,
+            )
 
         cv2.putText(
             depth_colormap,
@@ -1147,6 +1228,15 @@ try:
             2,
         )
         cv2.putText(
+            depth_colormap,
+            f"Max background {runtime_params['max_background_ratio']:.2f}",
+            (10, 120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
             raw_hough_image,
             "Raw Hough Lines",
             (10, 60),
@@ -1170,7 +1260,6 @@ try:
         cv2.putText(
             raw_hough_image,
             (
-                f"GapRef {runtime_params['gap_ref_px']}  "
                 f"GapRange {runtime_params['gap_min_px']}-{runtime_params['gap_max_px']}"
             ),
             (10, 115),
@@ -1250,9 +1339,13 @@ try:
                 ("Depth Bin mm", runtime_params["depth_bin_mm"]),
                 ("Min Valid %", int(round(runtime_params["min_valid_ratio"] * 100.0))),
                 ("Min Majority %", int(round(runtime_params["min_majority_ratio"] * 100.0))),
+                (
+                    "Max Background %",
+                    int(round(runtime_params["max_background_ratio"] * 100.0)),
+                ),
             ],
             width=520,
-            row_height=36,
+            row_height=34,
         )
         render_control_window(
             CAMERA_CONTROL_WINDOW_NAME,
