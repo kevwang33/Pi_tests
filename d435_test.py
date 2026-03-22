@@ -46,7 +46,7 @@ MAX_DEPTH_MM = int(MAX_DEPTH_M * 1000)
 # -----------------------------
 # Main Hough-line detector region
 # -----------------------------
-TOP_REGION_FRACTION = 1.0 / 2.0
+TOP_REGION_FRACTION = 2.0 / 2.0
 
 # -----------------------------
 # RGB preprocessing
@@ -1016,7 +1016,7 @@ try:
         depth_colormap = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
 
         top_limit = int(COLOR_HEIGHT * TOP_REGION_FRACTION)
-        hough_debug_image = np.zeros((COLOR_HEIGHT, COLOR_WIDTH, 3), dtype=np.uint8)
+        raw_hough_image = np.zeros((COLOR_HEIGHT, COLOR_WIDTH, 3), dtype=np.uint8)
 
         if DRAW_TOP_REGION_LINE:
             cv2.line(display_image, (0, top_limit), (COLOR_WIDTH, top_limit), TOP_REGION_COLOR, 2)
@@ -1036,11 +1036,11 @@ try:
 
         best_candidate = max(candidates, key=lambda c: c["score"]) if candidates else None
 
-        hough_debug_image = cv2.cvtColor(canny_edges, cv2.COLOR_GRAY2BGR)
+        canny_debug_image = cv2.cvtColor(canny_edges, cv2.COLOR_GRAY2BGR)
 
         for line in raw_hough_lines:
             x1, y1, x2, y2 = line
-            cv2.line(hough_debug_image, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            cv2.line(raw_hough_image, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
         # Draw final accepted branch candidates with distance color.
         for candidate in candidates:
@@ -1086,7 +1086,7 @@ try:
             2,
         )
         cv2.putText(
-            hough_debug_image,
+            raw_hough_image,
             f"Hough lines: {len(raw_hough_lines)}",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -1152,8 +1152,8 @@ try:
             2,
         )
         cv2.putText(
-            hough_debug_image,
-            "Canny + Hough Overlay",
+            raw_hough_image,
+            "Raw Hough Lines",
             (10, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.60,
@@ -1161,10 +1161,10 @@ try:
             2,
         )
         cv2.putText(
-            hough_debug_image,
+            raw_hough_image,
             (
-                f"Canny {runtime_params['canny_low']}/{runtime_params['canny_high']}  "
-                f"Hough {runtime_params['hough_threshold']}"
+                f"Hough {runtime_params['hough_threshold']}  "
+                f"MinLen {runtime_params['hough_min_line_length']}"
             ),
             (10, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -1173,9 +1173,8 @@ try:
             1,
         )
         cv2.putText(
-            hough_debug_image,
+            raw_hough_image,
             (
-                f"MinLen {runtime_params['hough_min_line_length']}  "
                 f"GapRef {runtime_params['gap_ref_px']}  "
                 f"GapRange {runtime_params['gap_min_px']}-{runtime_params['gap_max_px']}"
             ),
@@ -1186,7 +1185,40 @@ try:
             1,
         )
 
-        combined = np.hstack((display_image, depth_colormap, hough_debug_image))
+        cv2.putText(
+            canny_debug_image,
+            "Canny Edges",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            canny_debug_image,
+            f"Canny {runtime_params['canny_low']}/{runtime_params['canny_high']}",
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (255, 255, 255),
+            1,
+        )
+        cv2.putText(
+            canny_debug_image,
+            f"CLAHE x10 {int(round(runtime_params['clahe_clip_limit'] * 10.0))}",
+            (10, 85),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (255, 255, 255),
+            1,
+        )
+
+        combined = np.vstack(
+            (
+                np.hstack((display_image, depth_colormap)),
+                np.hstack((raw_hough_image, canny_debug_image)),
+            )
+        )
 
         cv2.imshow(MAIN_WINDOW_NAME, combined)
         render_control_window(
