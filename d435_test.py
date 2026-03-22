@@ -740,12 +740,7 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
 
     edges = cv2.Canny(blurred, runtime_params["canny_low"], runtime_params["canny_high"])
 
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_CLOSE_KERNEL)
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MORPH_OPEN_KERNEL)
     erode_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, MASK_ERODE_KERNEL)
-
-    binary = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_kernel)
 
     candidates = []
     reject_reasons = {
@@ -759,7 +754,7 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
     raw_hough_lines = []
     for line_gap_px in build_hough_gap_schedule(focal_length_px, runtime_params):
         lines = cv2.HoughLinesP(
-            binary,
+            edges,
             1,
             np.pi / 180.0,
             threshold=runtime_params["hough_threshold"],
