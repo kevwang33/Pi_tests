@@ -103,6 +103,7 @@ BOX_RED = (0, 0, 255)
 BOX_GREEN = (0, 255, 0)
 MAIN_WINDOW_NAME = "D435 Hough Line Branch Detection"
 CONTROL_WINDOW_NAME = "Raw Hough Controls"
+DEPTH_CONTROL_WINDOW_NAME = "Depth Controls"
 
 
 def _noop(_value):
@@ -175,6 +176,77 @@ def get_raw_hough_runtime_params():
         "gap_ref_px": gap_ref_px,
         "gap_min_px": gap_min_px,
         "gap_max_px": gap_max_px,
+    }
+
+
+def create_depth_trackbars():
+    cv2.namedWindow(DEPTH_CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.createTrackbar(
+        "Min Depth cm",
+        DEPTH_CONTROL_WINDOW_NAME,
+        int(round(MIN_DEPTH_M * 100.0)),
+        500,
+        _noop,
+    )
+    cv2.createTrackbar(
+        "Max Depth cm",
+        DEPTH_CONTROL_WINDOW_NAME,
+        int(round(MAX_DEPTH_M * 100.0)),
+        500,
+        _noop,
+    )
+    cv2.createTrackbar(
+        "Green cm",
+        DEPTH_CONTROL_WINDOW_NAME,
+        int(round(GREEN_THRESHOLD_M * 100.0)),
+        500,
+        _noop,
+    )
+    cv2.createTrackbar(
+        "Depth Bin mm",
+        DEPTH_CONTROL_WINDOW_NAME,
+        DEPTH_BIN_MM,
+        100,
+        _noop,
+    )
+    cv2.createTrackbar(
+        "Min Valid %",
+        DEPTH_CONTROL_WINDOW_NAME,
+        int(round(MIN_VALID_DEPTH_RATIO * 100.0)),
+        100,
+        _noop,
+    )
+    cv2.createTrackbar(
+        "Min Majority %",
+        DEPTH_CONTROL_WINDOW_NAME,
+        int(round(MIN_MAJORITY_RATIO * 100.0)),
+        100,
+        _noop,
+    )
+
+
+def get_depth_runtime_params():
+    min_depth_cm = cv2.getTrackbarPos("Min Depth cm", DEPTH_CONTROL_WINDOW_NAME)
+    max_depth_cm = cv2.getTrackbarPos("Max Depth cm", DEPTH_CONTROL_WINDOW_NAME)
+    green_cm = cv2.getTrackbarPos("Green cm", DEPTH_CONTROL_WINDOW_NAME)
+    depth_bin_mm = cv2.getTrackbarPos("Depth Bin mm", DEPTH_CONTROL_WINDOW_NAME)
+    min_valid_percent = cv2.getTrackbarPos("Min Valid %", DEPTH_CONTROL_WINDOW_NAME)
+    min_majority_percent = cv2.getTrackbarPos("Min Majority %", DEPTH_CONTROL_WINDOW_NAME)
+
+    min_depth_m = max(0.01, min_depth_cm / 100.0)
+    max_depth_m = max(min_depth_m + 0.01, max_depth_cm / 100.0)
+    green_threshold_m = np.clip(green_cm / 100.0, min_depth_m, max_depth_m)
+    depth_bin_mm = max(1, depth_bin_mm)
+
+    return {
+        "min_depth_m": float(min_depth_m),
+        "max_depth_m": float(max_depth_m),
+        "green_threshold_m": float(green_threshold_m),
+        "min_depth_mm": int(round(min_depth_m * 1000.0)),
+        "max_depth_mm": int(round(max_depth_m * 1000.0)),
+        "depth_bin_mm": int(depth_bin_mm),
+        "min_valid_ratio": float(np.clip(min_valid_percent / 100.0, 0.0, 1.0)),
+        "min_majority_ratio": float(np.clip(min_majority_percent / 100.0, 0.0, 1.0)),
     }
 
 
@@ -360,18 +432,20 @@ def build_hough_gap_schedule(focal_length_px, runtime_params):
         return [runtime_params["gap_ref_px"]]
 
     depth_samples_m = [
-        MIN_DEPTH_M,
-        GREEN_THRESHOLD_M,
+        runtime_params["min_depth_m"],
+        runtime_params["green_threshold_m"],
         0.35,
         0.50,
         0.75,
         1.00,
-        MAX_DEPTH_M,
+        runtime_params["max_depth_m"],
     ]
 
     gap_schedule = []
     for depth_m in depth_samples_m:
-        depth_m = float(np.clip(depth_m, MIN_DEPTH_M, MAX_DEPTH_M))
+        depth_m = float(
+            np.clip(depth_m, runtime_params["min_depth_m"], runtime_params["max_depth_m"])
+        )
         gap_px = estimate_pixels_for_length(reference_gap_m, depth_m, focal_length_px)
         if gap_px is None:
             continue
@@ -391,20 +465,25 @@ def build_hough_gap_schedule(focal_length_px, runtime_params):
     return sorted(set(gap_schedule))
 
 
-def dominant_depth_from_mask(depth_image, mask):
+def dominant_depth_from_mask(depth_image, mask, runtime_params):
     masked_pixels = depth_image[mask > 0]
     if masked_pixels.size == 0:
         return None
 
     valid_depth = masked_pixels[
-        (masked_pixels >= MIN_DEPTH_MM) & (masked_pixels <= MAX_DEPTH_MM)
+        (masked_pixels >= runtime_params["min_depth_mm"])
+        & (masked_pixels <= runtime_params["max_depth_mm"])
     ]
     if valid_depth.size == 0:
         return None
 
     valid_ratio = valid_depth.size / masked_pixels.size
 
-    bins = np.arange(MIN_DEPTH_MM, MAX_DEPTH_MM + DEPTH_BIN_MM, DEPTH_BIN_MM)
+    bins = np.arange(
+        runtime_params["min_depth_mm"],
+        runtime_params["max_depth_mm"] + runtime_params["depth_bin_mm"],
+        runtime_params["depth_bin_mm"],
+    )
     hist, edges = np.histogram(valid_depth, bins=bins)
 
     if hist.size == 0:
@@ -433,8 +512,8 @@ def dominant_depth_from_mask(depth_image, mask):
     }
 
 
-def depth_to_branch_color(depth_m):
-    if depth_m <= GREEN_THRESHOLD_M:
+def depth_to_branch_color(depth_m, runtime_params):
+    if depth_m <= runtime_params["green_threshold_m"]:
         return BOX_GREEN
     return BOX_RED
 
@@ -599,20 +678,20 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
             full_mask = np.zeros(depth_image.shape, dtype=np.uint8)
             full_mask[:top_limit, :] = mask
 
-            depth_vote = dominant_depth_from_mask(depth_image, full_mask)
+            depth_vote = dominant_depth_from_mask(depth_image, full_mask, runtime_params)
             if depth_vote is None:
                 reject_reasons["depth_none"] += 1
                 continue
 
-            if depth_vote["valid_ratio"] < MIN_VALID_DEPTH_RATIO:
+            if depth_vote["valid_ratio"] < runtime_params["min_valid_ratio"]:
                 reject_reasons["valid_ratio"] += 1
                 continue
-            if depth_vote["majority_ratio"] < MIN_MAJORITY_RATIO:
+            if depth_vote["majority_ratio"] < runtime_params["min_majority_ratio"]:
                 reject_reasons["majority_ratio"] += 1
                 continue
 
             depth_m = depth_vote["depth_m"]
-            if not (MIN_DEPTH_M <= depth_m <= MAX_DEPTH_M):
+            if not (runtime_params["min_depth_m"] <= depth_m <= runtime_params["max_depth_m"]):
                 reject_reasons["depth_range"] += 1
                 continue
 
@@ -716,6 +795,7 @@ temporal.set_option(rs.option.filter_smooth_alpha, 0.25)
 temporal.set_option(rs.option.filter_smooth_delta, 30)
 
 create_raw_hough_trackbars()
+create_depth_trackbars()
 print("Press 'q' to quit.")
 
 try:
@@ -749,9 +829,22 @@ try:
         else:
             depth_image = depth_raw
 
-        clipped = np.clip(depth_image, MIN_DEPTH_MM, MAX_DEPTH_MM)
+        hough_params = get_raw_hough_runtime_params()
+        depth_params = get_depth_runtime_params()
+        runtime_params = {**hough_params, **depth_params}
+
+        clipped = np.clip(
+            depth_image,
+            runtime_params["min_depth_mm"],
+            runtime_params["max_depth_mm"],
+        )
         normalized = (
-            (clipped - MIN_DEPTH_MM) / (MAX_DEPTH_MM - MIN_DEPTH_MM) * 255
+            (clipped - runtime_params["min_depth_mm"])
+            / max(
+                1,
+                runtime_params["max_depth_mm"] - runtime_params["min_depth_mm"],
+            )
+            * 255
         ).astype(np.uint8)
         depth_colormap = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
 
@@ -761,8 +854,6 @@ try:
         if DRAW_TOP_REGION_LINE:
             cv2.line(display_image, (0, top_limit), (COLOR_WIDTH, top_limit), TOP_REGION_COLOR, 2)
             cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
-
-        runtime_params = get_raw_hough_runtime_params()
 
         # Main Hough-line detector in top half.
         candidates, raw_hough_lines, reject_reasons = detect_branch_candidates(
@@ -784,7 +875,7 @@ try:
 
         # Draw final accepted branch candidates with distance color.
         for candidate in candidates:
-            color = depth_to_branch_color(candidate["depth_m"])
+            color = depth_to_branch_color(candidate["depth_m"], runtime_params)
             thickness = 4 if candidate is best_candidate else 2
 
             cv2.polylines(display_image, [candidate["box"]], True, color, thickness)
@@ -803,7 +894,9 @@ try:
                 2,
             )
 
-        close_count = sum(1 for c in candidates if c["depth_m"] <= GREEN_THRESHOLD_M)
+        close_count = sum(
+            1 for c in candidates if c["depth_m"] <= runtime_params["green_threshold_m"]
+        )
 
         cv2.putText(
             display_image,
@@ -840,7 +933,7 @@ try:
                 (10, 90),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
-                depth_to_branch_color(best_candidate["depth_m"]),
+                depth_to_branch_color(best_candidate["depth_m"], runtime_params),
                 2,
             )
             cv2.putText(
@@ -855,10 +948,37 @@ try:
 
         cv2.putText(
             depth_colormap,
-            f"Depth range: {MIN_DEPTH_M:.2f}m to {MAX_DEPTH_M:.2f}m",
+            (
+                f"Depth range: {runtime_params['min_depth_m']:.2f}m to "
+                f"{runtime_params['max_depth_m']:.2f}m"
+            ),
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.60,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            depth_colormap,
+            (
+                f"Green {runtime_params['green_threshold_m']:.2f}m  "
+                f"Bin {runtime_params['depth_bin_mm']}mm"
+            ),
+            (10, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+        )
+        cv2.putText(
+            depth_colormap,
+            (
+                f"Valid {runtime_params['min_valid_ratio']:.2f}  "
+                f"Majority {runtime_params['min_majority_ratio']:.2f}"
+            ),
+            (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
             (255, 255, 255),
             2,
         )
