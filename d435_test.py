@@ -1261,9 +1261,21 @@ try:
         cv2.putText(
             raw_hough_image,
             (
-                f"GapRange {runtime_params['gap_min_px']}-{runtime_params['gap_max_px']}"
+                f"StitchGap {runtime_params['gap_min_px']}-{runtime_params['gap_max_px']} px"
             ),
             (10, 115),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (255, 255, 255),
+            1,
+        )
+        cv2.putText(
+            raw_hough_image,
+            (
+                f"PairGap {MIN_PAIR_GAP_M * 39.3701:.1f}-"
+                f"{MAX_PAIR_GAP_M * 39.3701:.1f} in"
+            ),
+            (10, 140),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
             (255, 255, 255),
