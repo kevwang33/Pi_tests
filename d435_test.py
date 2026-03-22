@@ -219,6 +219,20 @@ def create_raw_hough_trackbars():
         300,
         _noop,
     )
+    cv2.createTrackbar(
+        "Pair Min x10 in",
+        CONTROL_WINDOW_NAME,
+        int(round(MIN_PAIR_GAP_M * 39.3701 * 10.0)),
+        100,
+        _noop,
+    )
+    cv2.createTrackbar(
+        "Pair Max x10 in",
+        CONTROL_WINDOW_NAME,
+        int(round(MAX_PAIR_GAP_M * 39.3701 * 10.0)),
+        200,
+        _noop,
+    )
 
 
 def get_raw_hough_runtime_params():
@@ -227,12 +241,16 @@ def get_raw_hough_runtime_params():
     gap_ref_px = cv2.getTrackbarPos("Gap Ref Px", CONTROL_WINDOW_NAME)
     gap_min_px = cv2.getTrackbarPos("Gap Min Px", CONTROL_WINDOW_NAME)
     gap_max_px = cv2.getTrackbarPos("Gap Max Px", CONTROL_WINDOW_NAME)
+    pair_min_tenth_in = cv2.getTrackbarPos("Pair Min x10 in", CONTROL_WINDOW_NAME)
+    pair_max_tenth_in = cv2.getTrackbarPos("Pair Max x10 in", CONTROL_WINDOW_NAME)
 
     hough_threshold = max(1, hough_threshold)
     hough_min_line_length = max(1, hough_min_line_length)
     gap_ref_px = max(1, gap_ref_px)
     gap_min_px = max(1, gap_min_px)
     gap_max_px = max(gap_min_px, gap_max_px)
+    pair_min_gap_m = max(0.0, pair_min_tenth_in / 10.0 / 39.3701)
+    pair_max_gap_m = max(pair_min_gap_m, pair_max_tenth_in / 10.0 / 39.3701)
 
     return {
         "hough_threshold": hough_threshold,
@@ -240,6 +258,8 @@ def get_raw_hough_runtime_params():
         "gap_ref_px": gap_ref_px,
         "gap_min_px": gap_min_px,
         "gap_max_px": gap_max_px,
+        "pair_min_gap_m": pair_min_gap_m,
+        "pair_max_gap_m": pair_max_gap_m,
     }
 
 
@@ -933,7 +953,11 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
                 if estimated_gap_m is None:
                     reject_reasons["pair_gap"] += 1
                     continue
-                if not (MIN_PAIR_GAP_M <= estimated_gap_m <= MAX_PAIR_GAP_M):
+                if not (
+                    runtime_params["pair_min_gap_m"]
+                    <= estimated_gap_m
+                    <= runtime_params["pair_max_gap_m"]
+                ):
                     reject_reasons["pair_gap"] += 1
                     continue
 
@@ -1272,8 +1296,8 @@ try:
         cv2.putText(
             raw_hough_image,
             (
-                f"PairGap {MIN_PAIR_GAP_M * 39.3701:.1f}-"
-                f"{MAX_PAIR_GAP_M * 39.3701:.1f} in"
+                f"PairGap {runtime_params['pair_min_gap_m'] * 39.3701:.1f}-"
+                f"{runtime_params['pair_max_gap_m'] * 39.3701:.1f} in"
             ),
             (10, 140),
             cv2.FONT_HERSHEY_SIMPLEX,
@@ -1338,9 +1362,17 @@ try:
                 ("Gap Ref Px", runtime_params["gap_ref_px"]),
                 ("Gap Min Px", runtime_params["gap_min_px"]),
                 ("Gap Max Px", runtime_params["gap_max_px"]),
+                (
+                    "Pair Min in",
+                    round(runtime_params["pair_min_gap_m"] * 39.3701, 1),
+                ),
+                (
+                    "Pair Max in",
+                    round(runtime_params["pair_max_gap_m"] * 39.3701, 1),
+                ),
             ],
             width=520,
-            row_height=38,
+            row_height=32,
         )
         render_control_window(
             DEPTH_CONTROL_WINDOW_NAME,
