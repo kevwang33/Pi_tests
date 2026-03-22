@@ -892,6 +892,28 @@ try:
             (0, 255, 0),
             2,
         )
+        red_candidates = [
+            c
+            for c in candidates
+            if c["depth_m"] > runtime_params["green_threshold_m"]
+        ]
+        if red_candidates:
+            closest_red = min(red_candidates, key=lambda c: c["depth_m"])
+            red_angle_deg = closest_red["horizontal_dev_deg"]
+            red_angle_text = (
+                f"Closest red angle: {red_angle_deg:.1f} deg from horizontal"
+            )
+        else:
+            red_angle_text = "Closest red angle: n/a"
+        cv2.putText(
+            display_image,
+            red_angle_text,
+            (10, 90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.60,
+            BOX_RED,
+            2,
+        )
         cv2.putText(
             raw_hough_image,
             f"Hough lines: {len(raw_hough_lines)}",
@@ -906,7 +928,7 @@ try:
             cv2.putText(
                 display_image,
                 f"Best depth: {best_candidate['depth_m']:.2f} m",
-                (10, 90),
+                (10, 120),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
                 depth_to_branch_color(best_candidate["depth_m"], runtime_params),
@@ -915,7 +937,7 @@ try:
             cv2.putText(
                 display_image,
                 f"Length: {best_candidate['estimated_length_m'] * 39.3701:.1f} in",
-                (10, 120),
+                (10, 150),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
                 (255, 255, 255),
@@ -927,7 +949,7 @@ try:
             cv2.putText(
                 display_image,
                 width_text,
-                (10, 150),
+                (10, 180),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
                 (255, 255, 255),
