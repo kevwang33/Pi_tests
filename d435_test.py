@@ -104,8 +104,7 @@ BOX_GREEN = (0, 255, 0)
 MAIN_WINDOW_NAME = "D435 Hough Line Branch Detection"
 CONTROL_WINDOW_NAME = "Raw Hough Controls"
 DEPTH_CONTROL_WINDOW_NAME = "Depth Controls"
-CONTROL_LABEL_WINDOW_NAME = "Raw Hough Labels"
-DEPTH_LABEL_WINDOW_NAME = "Depth Labels"
+CAMERA_CONTROL_WINDOW_NAME = "Camera Controls"
 
 
 def _noop(_value):
@@ -141,11 +140,25 @@ def render_label_panel(title, rows, width=520, row_height=34):
     return panel
 
 
+def format_slider_value(value):
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    return str(value)
+
+
+def render_control_window(window_name, title, rows, width=520, row_height=34):
+    panel = render_label_panel(
+        title,
+        [(label, format_slider_value(value)) for label, value in rows],
+        width=width,
+        row_height=row_height,
+    )
+    cv2.imshow(window_name, panel)
+
+
 def create_raw_hough_trackbars():
     cv2.namedWindow(CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(CONTROL_WINDOW_NAME, 520, 320)
-    cv2.namedWindow(CONTROL_LABEL_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(CONTROL_LABEL_WINDOW_NAME, 520, 320)
     cv2.createTrackbar("Canny Low", CONTROL_WINDOW_NAME, CANNY_LOW, 255, _noop)
     cv2.createTrackbar("Canny High", CONTROL_WINDOW_NAME, CANNY_HIGH, 255, _noop)
     cv2.createTrackbar(
@@ -216,8 +229,6 @@ def get_raw_hough_runtime_params():
 def create_depth_trackbars():
     cv2.namedWindow(DEPTH_CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(DEPTH_CONTROL_WINDOW_NAME, 520, 280)
-    cv2.namedWindow(DEPTH_LABEL_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(DEPTH_LABEL_WINDOW_NAME, 520, 280)
     cv2.createTrackbar(
         "Min Depth cm",
         DEPTH_CONTROL_WINDOW_NAME,
@@ -285,6 +296,99 @@ def get_depth_runtime_params():
         "min_valid_ratio": float(np.clip(min_valid_percent / 100.0, 0.0, 1.0)),
         "min_majority_ratio": float(np.clip(min_majority_percent / 100.0, 0.0, 1.0)),
     }
+
+
+def create_camera_trackbars():
+    cv2.namedWindow(CAMERA_CONTROL_WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(CAMERA_CONTROL_WINDOW_NAME, 560, 420)
+    cv2.createTrackbar("Visual Preset", CAMERA_CONTROL_WINDOW_NAME, 4, 5, _noop)
+    cv2.createTrackbar("Emitter", CAMERA_CONTROL_WINDOW_NAME, 1, 1, _noop)
+    cv2.createTrackbar("Laser Power", CAMERA_CONTROL_WINDOW_NAME, 180, 360, _noop)
+    cv2.createTrackbar("Auto Exposure", CAMERA_CONTROL_WINDOW_NAME, 1, 1, _noop)
+    cv2.createTrackbar("Exposure", CAMERA_CONTROL_WINDOW_NAME, 8500, 20000, _noop)
+    cv2.createTrackbar("Gain", CAMERA_CONTROL_WINDOW_NAME, 16, 128, _noop)
+    cv2.createTrackbar("Spatial Mag", CAMERA_CONTROL_WINDOW_NAME, 1, 5, _noop)
+    cv2.createTrackbar("Spatial A x100", CAMERA_CONTROL_WINDOW_NAME, 35, 100, _noop)
+    cv2.createTrackbar("Spatial Delta", CAMERA_CONTROL_WINDOW_NAME, 30, 100, _noop)
+    cv2.createTrackbar("Temporal A x100", CAMERA_CONTROL_WINDOW_NAME, 25, 100, _noop)
+    cv2.createTrackbar("Temporal Delta", CAMERA_CONTROL_WINDOW_NAME, 30, 100, _noop)
+
+
+def get_camera_runtime_params():
+    return {
+        "visual_preset": cv2.getTrackbarPos("Visual Preset", CAMERA_CONTROL_WINDOW_NAME),
+        "emitter_enabled": cv2.getTrackbarPos("Emitter", CAMERA_CONTROL_WINDOW_NAME),
+        "laser_power": cv2.getTrackbarPos("Laser Power", CAMERA_CONTROL_WINDOW_NAME),
+        "auto_exposure": cv2.getTrackbarPos("Auto Exposure", CAMERA_CONTROL_WINDOW_NAME),
+        "exposure": max(1, cv2.getTrackbarPos("Exposure", CAMERA_CONTROL_WINDOW_NAME)),
+        "gain": max(1, cv2.getTrackbarPos("Gain", CAMERA_CONTROL_WINDOW_NAME)),
+        "spatial_magnitude": max(
+            1, cv2.getTrackbarPos("Spatial Mag", CAMERA_CONTROL_WINDOW_NAME)
+        ),
+        "spatial_alpha": max(
+            0.01, cv2.getTrackbarPos("Spatial A x100", CAMERA_CONTROL_WINDOW_NAME) / 100.0
+        ),
+        "spatial_delta": max(
+            1, cv2.getTrackbarPos("Spatial Delta", CAMERA_CONTROL_WINDOW_NAME)
+        ),
+        "temporal_alpha": max(
+            0.01, cv2.getTrackbarPos("Temporal A x100", CAMERA_CONTROL_WINDOW_NAME) / 100.0
+        ),
+        "temporal_delta": max(
+            1, cv2.getTrackbarPos("Temporal Delta", CAMERA_CONTROL_WINDOW_NAME)
+        ),
+    }
+
+
+def safe_set_option(sensor_or_filter, option, value):
+    try:
+        sensor_or_filter.set_option(option, value)
+        return True
+    except Exception:
+        return False
+
+
+def apply_camera_runtime_params(
+    depth_sensor,
+    spatial_filter,
+    temporal_filter,
+    runtime_params,
+    last_camera_settings,
+):
+    settings_to_apply = {
+        "visual_preset": float(runtime_params["visual_preset"]),
+        "emitter_enabled": float(runtime_params["emitter_enabled"]),
+        "laser_power": float(runtime_params["laser_power"]),
+        "auto_exposure": float(runtime_params["auto_exposure"]),
+        "exposure": float(runtime_params["exposure"]),
+        "gain": float(runtime_params["gain"]),
+        "spatial_magnitude": float(runtime_params["spatial_magnitude"]),
+        "spatial_alpha": float(runtime_params["spatial_alpha"]),
+        "spatial_delta": float(runtime_params["spatial_delta"]),
+        "temporal_alpha": float(runtime_params["temporal_alpha"]),
+        "temporal_delta": float(runtime_params["temporal_delta"]),
+    }
+
+    option_targets = {
+        "visual_preset": (depth_sensor, rs.option.visual_preset),
+        "emitter_enabled": (depth_sensor, rs.option.emitter_enabled),
+        "laser_power": (depth_sensor, rs.option.laser_power),
+        "auto_exposure": (depth_sensor, rs.option.enable_auto_exposure),
+        "exposure": (depth_sensor, rs.option.exposure),
+        "gain": (depth_sensor, rs.option.gain),
+        "spatial_magnitude": (spatial_filter, rs.option.filter_magnitude),
+        "spatial_alpha": (spatial_filter, rs.option.filter_smooth_alpha),
+        "spatial_delta": (spatial_filter, rs.option.filter_smooth_delta),
+        "temporal_alpha": (temporal_filter, rs.option.filter_smooth_alpha),
+        "temporal_delta": (temporal_filter, rs.option.filter_smooth_delta),
+    }
+
+    for key, value in settings_to_apply.items():
+        if last_camera_settings.get(key) == value:
+            continue
+        target, option = option_targets[key]
+        if safe_set_option(target, option, value):
+            last_camera_settings[key] = value
 
 
 def start_pipeline_with_fallback():
@@ -833,6 +937,8 @@ temporal.set_option(rs.option.filter_smooth_delta, 30)
 
 create_raw_hough_trackbars()
 create_depth_trackbars()
+create_camera_trackbars()
+last_camera_settings = {}
 print("Press 'q' to quit.")
 
 try:
@@ -868,36 +974,15 @@ try:
 
         hough_params = get_raw_hough_runtime_params()
         depth_params = get_depth_runtime_params()
-        runtime_params = {**hough_params, **depth_params}
+        camera_params = get_camera_runtime_params()
+        runtime_params = {**hough_params, **depth_params, **camera_params}
 
-        raw_hough_label_panel = render_label_panel(
-            "Raw Hough Controls",
-            [
-                ("Canny Low", runtime_params["canny_low"]),
-                ("Canny High", runtime_params["canny_high"]),
-                ("CLAHE x10", int(round(runtime_params["clahe_clip_limit"] * 10.0))),
-                ("Hough Threshold", runtime_params["hough_threshold"]),
-                ("Min Line Len", runtime_params["hough_min_line_length"]),
-                ("Gap Ref Px", runtime_params["gap_ref_px"]),
-                ("Gap Min Px", runtime_params["gap_min_px"]),
-                ("Gap Max Px", runtime_params["gap_max_px"]),
-            ],
-        )
-        depth_label_panel = render_label_panel(
-            "Depth Controls",
-            [
-                ("Min Depth cm", int(round(runtime_params["min_depth_m"] * 100.0))),
-                ("Max Depth cm", int(round(runtime_params["max_depth_m"] * 100.0))),
-                ("Green cm", int(round(runtime_params["green_threshold_m"] * 100.0))),
-                ("Depth Bin mm", runtime_params["depth_bin_mm"]),
-                ("Min Valid %", int(round(runtime_params["min_valid_ratio"] * 100.0))),
-                (
-                    "Min Majority %",
-                    int(round(runtime_params["min_majority_ratio"] * 100.0)),
-                ),
-            ],
-            width=520,
-            row_height=36,
+        apply_camera_runtime_params(
+            depth_sensor,
+            spatial,
+            temporal,
+            runtime_params,
+            last_camera_settings,
         )
 
         clipped = np.clip(
@@ -1088,8 +1173,53 @@ try:
         combined = np.hstack((display_image, depth_colormap, hough_debug_bgr))
 
         cv2.imshow(MAIN_WINDOW_NAME, combined)
-        cv2.imshow(CONTROL_LABEL_WINDOW_NAME, raw_hough_label_panel)
-        cv2.imshow(DEPTH_LABEL_WINDOW_NAME, depth_label_panel)
+        render_control_window(
+            CONTROL_WINDOW_NAME,
+            "Raw Hough Controls",
+            [
+                ("Canny Low", runtime_params["canny_low"]),
+                ("Canny High", runtime_params["canny_high"]),
+                ("CLAHE x10", int(round(runtime_params["clahe_clip_limit"] * 10.0))),
+                ("Hough Threshold", runtime_params["hough_threshold"]),
+                ("Min Line Len", runtime_params["hough_min_line_length"]),
+                ("Gap Ref Px", runtime_params["gap_ref_px"]),
+                ("Gap Min Px", runtime_params["gap_min_px"]),
+                ("Gap Max Px", runtime_params["gap_max_px"]),
+            ],
+        )
+        render_control_window(
+            DEPTH_CONTROL_WINDOW_NAME,
+            "Depth Controls",
+            [
+                ("Min Depth cm", int(round(runtime_params["min_depth_m"] * 100.0))),
+                ("Max Depth cm", int(round(runtime_params["max_depth_m"] * 100.0))),
+                ("Green cm", int(round(runtime_params["green_threshold_m"] * 100.0))),
+                ("Depth Bin mm", runtime_params["depth_bin_mm"]),
+                ("Min Valid %", int(round(runtime_params["min_valid_ratio"] * 100.0))),
+                ("Min Majority %", int(round(runtime_params["min_majority_ratio"] * 100.0))),
+            ],
+            width=520,
+            row_height=36,
+        )
+        render_control_window(
+            CAMERA_CONTROL_WINDOW_NAME,
+            "Camera Controls",
+            [
+                ("Visual Preset", runtime_params["visual_preset"]),
+                ("Emitter", runtime_params["emitter_enabled"]),
+                ("Laser Power", runtime_params["laser_power"]),
+                ("Auto Exposure", runtime_params["auto_exposure"]),
+                ("Exposure", runtime_params["exposure"]),
+                ("Gain", runtime_params["gain"]),
+                ("Spatial Mag", runtime_params["spatial_magnitude"]),
+                ("Spatial Alpha", runtime_params["spatial_alpha"]),
+                ("Spatial Delta", runtime_params["spatial_delta"]),
+                ("Temporal Alpha", runtime_params["temporal_alpha"]),
+                ("Temporal Delta", runtime_params["temporal_delta"]),
+            ],
+            width=560,
+            row_height=32,
+        )
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
