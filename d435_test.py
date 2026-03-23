@@ -768,7 +768,7 @@ last_camera_settings = {}
 
 STM32_PORT = '/dev/ttyACM0'
 STM32_BAUD = 115200
-GREEN_HOLD_SECONDS = 3.0
+GREEN_HOLD_SECONDS = 0.1
 
 try:
     stm32_ser = serial.Serial(STM32_PORT, STM32_BAUD, timeout=1)
