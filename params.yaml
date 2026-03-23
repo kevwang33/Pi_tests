@@ -1,35 +1,32 @@
 canny:
-  canny_low: 19
-  canny_high: 69
-  clahe_clip_limit: 6.2
-
+  canny_low: 15
+  canny_high: 114
+  clahe_clip_limit: 3.2
 hough:
-  hough_threshold: 131
-  hough_min_line_length: 142
-  gap_ref_px: 28
+  hough_threshold: 109
+  hough_min_line_length: 35
+  gap_ref_px: 47
   gap_min_px: 105
   gap_max_px: 206
-  pair_min_gap_inches_x10: 10
-  pair_max_gap_inches_x10: 35
-
+  pair_min_gap_inches_x10: 9
+  pair_max_gap_inches_x10: 21
 depth:
   min_depth_cm: 4
   max_depth_cm: 200
-  green_threshold_cm: 20
+  green_threshold_cm: 30
   depth_bin_mm: 20
   min_valid_percent: 5
   min_majority_percent: 18
   max_background_percent: 60
-
 camera:
-  visual_preset: 4
-  emitter_enabled: 1
-  laser_power: 180
-  auto_exposure: 1
-  exposure: 8500
-  gain: 16
-  spatial_magnitude: 1
-  spatial_alpha_x100: 35
-  spatial_delta: 30
-  temporal_alpha_x100: 25
-  temporal_delta: 30
+  visual_preset: 0
+  emitter_enabled: 0
+  laser_power: 0
+  auto_exposure: 0
+  exposure: 9828
+  gain: 1
+  spatial_magnitude: 5
+  spatial_alpha_x100: 60
+  spatial_delta: 4
+  temporal_alpha_x100: 92
+  temporal_delta: 21
