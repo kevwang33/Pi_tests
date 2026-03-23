@@ -1,5 +1,7 @@
 import cv2
 import numpy as np
+import serial
+import time
 
 from param_gui import ParamGUI
 
@@ -763,6 +765,22 @@ temporal.set_option(rs.option.filter_smooth_delta, 30)
 
 gui = ParamGUI("params.yaml")
 last_camera_settings = {}
+
+STM32_PORT = '/dev/ttyACM0'
+STM32_BAUD = 115200
+GREEN_HOLD_SECONDS = 3.0
+
+try:
+    stm32_ser = serial.Serial(STM32_PORT, STM32_BAUD, timeout=1)
+    print(f"Connected to STM32 on {STM32_PORT}")
+    time.sleep(2)
+except serial.SerialException as e:
+    print(f"Warning: Could not open STM32 serial port: {e}")
+    stm32_ser = None
+
+green_start_time = None
+curl_sent = False
+
 print("Press 'q' to quit.")
 
 try:
@@ -873,6 +891,18 @@ try:
         close_count = sum(
             1 for c in candidates if c["depth_m"] <= runtime_params["green_threshold_m"]
         )
+
+        if close_count > 0:
+            if green_start_time is None:
+                green_start_time = time.time()
+            elif not curl_sent and (time.time() - green_start_time) >= GREEN_HOLD_SECONDS:
+                if stm32_ser is not None and stm32_ser.is_open:
+                    stm32_ser.write(b'curl 2000\n')
+                    print("Sent to STM32: curl 2000")
+                curl_sent = True
+        else:
+            green_start_time = None
+            curl_sent = False
 
         cv2.putText(
             display_image,
@@ -1090,6 +1120,9 @@ finally:
     pipeline.stop()
     gui.root.destroy()
     cv2.destroyAllWindows()
+    if stm32_ser is not None and stm32_ser.is_open:
+        stm32_ser.close()
+        print("STM32 serial connection closed")
 
 
 
