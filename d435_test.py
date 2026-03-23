@@ -902,7 +902,6 @@ try:
                 curl_sent = True
         else:
             green_start_time = None
-            curl_sent = False
 
         cv2.putText(
             display_image,
