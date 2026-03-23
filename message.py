@@ -3,7 +3,7 @@ import time
 
 # Configure serial connection
 port = '/dev/ttyACM0'
-baud_rate = 9600  # Change this to match your Arduino's baud rate
+baud_rate = 115200  # Change this to match your Arduino's baud rate
 
 try:
     # Open serial connection
@@ -15,11 +15,17 @@ try:
     
     while True:
         # Send "hi" to Arduino
-        ser.write(b'hi\n')
-        print("Sent: hi")
+        ser.write(b'led_r_on\n')
+        print("Sent: led_r_on")
         
         # Wait 3 seconds
-        time.sleep(3)
+        time.sleep(1)
+        
+        ser.write(b'led_r_off\n')
+        print("Sent: led_r_off")
+        
+        # Wait 3 seconds
+        time.sleep(1)
         
 except serial.SerialException as e:
     print(f"Error connecting to Arduino: {e}")
