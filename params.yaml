@@ -10,6 +10,7 @@ hough:
   gap_max_px: 206
   pair_min_gap_inches_x10: 9
   pair_max_gap_inches_x10: 21
+  exclude_background_hough_lines: 1
 depth:
   min_depth_cm: 4
   max_depth_cm: 200

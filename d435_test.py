@@ -81,7 +81,7 @@ HOUGH_LINE_CONNECT_GAP_REFERENCE_DEPTH_M = 1.0
 HOUGH_LINE_CONNECT_GAP_MIN_PX = 105
 HOUGH_LINE_CONNECT_GAP_MAX_PX = 206
 
-MAX_HORIZONTAL_DEVIATION_DEG = 95.0
+MAX_HORIZONTAL_DEVIATION_DEG = 15.0
 MAX_PAIR_ANGLE_DIFF_DEG = 12.0
 MIN_ESTIMATED_LENGTH_M = 0.127  # 5 inches
 MIN_PAIR_GAP_M = 0.0254  # 1 inch
@@ -413,6 +413,25 @@ def build_hough_min_length_schedule(focal_length_px, runtime_params):
     return sorted(set(min_length_schedule))
 
 
+def line_has_in_range_depth(depth_image, line, runtime_params):
+    x1, y1, x2, y2 = line
+    image_h, image_w = depth_image.shape[:2]
+    sample_count = int(np.clip(round(line_length(*line) / 3.0), 8, 160))
+
+    xs = np.rint(np.linspace(x1, x2, sample_count)).astype(np.int32)
+    ys = np.rint(np.linspace(y1, y2, sample_count)).astype(np.int32)
+    xs = np.clip(xs, 0, image_w - 1)
+    ys = np.clip(ys, 0, image_h - 1)
+
+    sampled_depth = depth_image[ys, xs]
+    valid_mask = (
+        (sampled_depth >= runtime_params["min_depth_mm"])
+        & (sampled_depth <= runtime_params["max_depth_mm"])
+    )
+    valid_ratio = float(np.count_nonzero(valid_mask)) / float(sample_count)
+    return valid_ratio >= runtime_params["min_valid_ratio"]
+
+
 def dominant_depth_from_mask(depth_image, mask, runtime_params):
     masked_pixels = depth_image[mask > 0]
     if masked_pixels.size == 0:
@@ -551,7 +570,7 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
     candidates = []
     reject_reasons = {
         "no_lines": 0, "angle": 0, "duplicates": 0, "pair_angle": 0,
-        "pair_gap": 0,
+        "pair_gap": 0, "background_hough": 0,
         "minor_axis": 0, "length": 0, "background": 0,
         "depth_none": 0, "valid_ratio": 0, "majority_ratio": 0,
         "depth_range": 0,
@@ -578,11 +597,25 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
             raw_hough_lines.extend(tuple(map(int, line[0])) for line in lines)
 
     raw_hough_lines = list(dict.fromkeys(raw_hough_lines))
+    raw_hough_line_count = len(raw_hough_lines)
     if not raw_hough_lines:
         reject_reasons["no_lines"] += 1
-        return candidates, [], reject_reasons, edges
+        return candidates, [], 0, reject_reasons, edges
+
+    display_hough_lines = raw_hough_lines
+    if runtime_params.get("exclude_background_hough_lines", False):
+        display_hough_lines = []
+        for line in raw_hough_lines:
+            if line_has_in_range_depth(depth_image, line, runtime_params):
+                display_hough_lines.append(line)
+            else:
+                reject_reasons["background_hough"] += 1
+
+        if not display_hough_lines:
+            return candidates, [], raw_hough_line_count, reject_reasons, edges
+
     horizontal_lines = []
-    for x1, y1, x2, y2 in raw_hough_lines:
+    for x1, y1, x2, y2 in display_hough_lines:
         angle = line_angle_degrees(x1, y1, x2, y2)
         horizontal_dev = horizontal_deviation_degrees(angle)
         if horizontal_dev > MAX_HORIZONTAL_DEVIATION_DEG:
@@ -724,7 +757,7 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
             candidates.append(candidate)
 
     candidates = suppress_overlapping_candidates(candidates)
-    return candidates, raw_hough_lines, reject_reasons, edges
+    return candidates, display_hough_lines, raw_hough_line_count, reject_reasons, edges
 
 
 pipeline, profile, active_profile = start_pipeline_with_fallback()
@@ -848,7 +881,7 @@ try:
             cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
 
         # Main Hough-line detector in top half.
-        candidates, raw_hough_lines, reject_reasons, canny_edges = detect_branch_candidates(
+        candidates, raw_hough_lines, raw_hough_line_count, reject_reasons, canny_edges = detect_branch_candidates(
             color_image,
             depth_image,
             COLOR_FOCAL_LENGTH_PX,
@@ -945,7 +978,11 @@ try:
         )
         cv2.putText(
             raw_hough_image,
-            f"Hough lines: {len(raw_hough_lines)}",
+            (
+                f"Hough lines: {len(raw_hough_lines)}/{raw_hough_line_count}"
+                if runtime_params.get("exclude_background_hough_lines", False)
+                else f"Hough lines: {len(raw_hough_lines)}"
+            ),
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -1097,6 +1134,19 @@ try:
             canny_debug_image,
             f"CLAHE x10 {int(round(runtime_params['clahe_clip_limit'] * 10.0))}",
             (10, 85),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (255, 255, 255),
+            1,
+        )
+        cv2.putText(
+            raw_hough_image,
+            (
+                "Exclude BG Hough: on"
+                if runtime_params.get("exclude_background_hough_lines", False)
+                else "Exclude BG Hough: off"
+            ),
+            (10, 165),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
             (255, 255, 255),

@@ -24,6 +24,7 @@ DEFAULT_PARAMS = {
         "gap_max_px": 206,
         "pair_min_gap_inches_x10": 10,
         "pair_max_gap_inches_x10": 35,
+        "exclude_background_hough_lines": 1,
     },
     "depth": {
         "min_depth_cm": 4,
@@ -82,6 +83,15 @@ PARAM_DEFS: list[dict] = [
         "label": "Pair Max (x0.1 in)",
         "min": 0,
         "max": 200,
+        "res": 1,
+        "kind": "int",
+    },
+    {
+        "section": "hough",
+        "key": "exclude_background_hough_lines",
+        "label": "Exclude BG Hough",
+        "min": 0,
+        "max": 1,
         "res": 1,
         "kind": "int",
     },
@@ -365,6 +375,9 @@ class ParamGUI:
             "gap_max_px": gap_max_px,
             "pair_min_gap_m": pair_min_gap_m,
             "pair_max_gap_m": pair_max_gap_m,
+            "exclude_background_hough_lines": bool(
+                int(h["exclude_background_hough_lines"])
+            ),
             "min_depth_m": float(min_depth_m),
             "max_depth_m": float(max_depth_m),
             "green_threshold_m": float(green_threshold_m),
