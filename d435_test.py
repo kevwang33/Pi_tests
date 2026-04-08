@@ -110,6 +110,11 @@ TOP_REGION_COLOR = (255, 255, 0)
 BOX_RED = (0, 0, 255)
 BOX_GREEN = (0, 255, 0)
 MAIN_WINDOW_NAME = "D435 Hough Line Branch Detection"
+TRACK_SMOOTHING_ALPHA = 0.35
+TRACK_MAX_MISSING_FRAMES = 4
+TRACK_MATCH_MAX_CENTER_PX = 120.0
+TRACK_MATCH_MIN_IOU = 0.05
+DEBUG_IMAGE_ALPHA = 0.35
 
 
 def safe_set_option(sensor_or_filter, option, value):
@@ -549,6 +554,95 @@ def suppress_overlapping_candidates(candidates, iou_threshold=0.45):
     return kept
 
 
+def blend_debug_image(previous_image, current_image, alpha):
+    if previous_image is None or previous_image.shape != current_image.shape:
+        return current_image.copy()
+    return cv2.addWeighted(current_image, alpha, previous_image, 1.0 - alpha, 0.0)
+
+
+def clamp_box_points(box_points, width, height):
+    clamped = box_points.astype(np.float32).copy()
+    clamped[:, 0] = np.clip(clamped[:, 0], 0, width - 1)
+    clamped[:, 1] = np.clip(clamped[:, 1], 0, height - 1)
+    return np.rint(clamped).astype(np.int32)
+
+
+def smooth_candidate(previous_candidate, current_candidate, image_w, image_h):
+    alpha = TRACK_SMOOTHING_ALPHA
+    smoothed = dict(current_candidate)
+
+    previous_box = previous_candidate["box"].astype(np.float32)
+    current_box = current_candidate["box"].astype(np.float32)
+    blended_box = (1.0 - alpha) * previous_box + alpha * current_box
+    smoothed["box"] = clamp_box_points(blended_box, image_w, image_h)
+    box_x, box_y, box_w, box_h = cv2.boundingRect(smoothed["box"])
+    smoothed["bbox"] = clamp_bbox(
+        (box_x, box_y, box_x + box_w, box_y + box_h),
+        image_w,
+        image_h,
+    )
+
+    previous_center = np.array(previous_candidate["center"], dtype=np.float32)
+    current_center = np.array(current_candidate["center"], dtype=np.float32)
+    blended_center = (1.0 - alpha) * previous_center + alpha * current_center
+    smoothed["center"] = (float(blended_center[0]), float(blended_center[1]))
+
+    for key in (
+        "major_axis",
+        "minor_axis",
+        "horizontal_dev_deg",
+        "depth_m",
+        "line_a_length_m",
+        "line_b_length_m",
+        "estimated_length_m",
+        "valid_ratio",
+        "majority_ratio",
+        "background_ratio",
+        "score",
+    ):
+        smoothed[key] = float(
+            (1.0 - alpha) * float(previous_candidate[key])
+            + alpha * float(current_candidate[key])
+        )
+
+    if (
+        previous_candidate.get("pair_gap_m") is not None
+        and current_candidate.get("pair_gap_m") is not None
+    ):
+        smoothed["pair_gap_m"] = float(
+            (1.0 - alpha) * float(previous_candidate["pair_gap_m"])
+            + alpha * float(current_candidate["pair_gap_m"])
+        )
+    else:
+        smoothed["pair_gap_m"] = current_candidate.get("pair_gap_m")
+
+    return smoothed
+
+
+def match_tracked_candidate(tracked_candidate, candidates):
+    if tracked_candidate is None or not candidates:
+        return None
+
+    tracked_center = np.array(tracked_candidate["center"], dtype=np.float32)
+    best_match = None
+    best_score = None
+
+    for candidate in candidates:
+        candidate_center = np.array(candidate["center"], dtype=np.float32)
+        center_distance = float(np.linalg.norm(candidate_center - tracked_center))
+        overlap = bbox_iou(tracked_candidate["bbox"], candidate["bbox"])
+
+        if center_distance > TRACK_MATCH_MAX_CENTER_PX and overlap < TRACK_MATCH_MIN_IOU:
+            continue
+
+        match_score = overlap + 0.25 * candidate["score"] - 0.002 * center_distance
+        if best_score is None or match_score > best_score:
+            best_score = match_score
+            best_match = candidate
+
+    return best_match
+
+
 def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_params):
     image_h, image_w = color_image.shape[:2]
     top_limit = int(image_h * TOP_REGION_FRACTION)
@@ -813,6 +907,10 @@ except serial.SerialException as e:
 
 green_start_time = None
 curl_sent = False
+tracked_best_candidate = None
+tracked_missing_frames = 0
+previous_raw_hough_image = None
+previous_canny_debug_image = None
 
 print("Press 'q' to quit.")
 
@@ -894,16 +992,50 @@ try:
 
         best_candidate = max(candidates, key=lambda c: c["score"]) if candidates else None
 
-        canny_debug_image = cv2.cvtColor(canny_edges, cv2.COLOR_GRAY2BGR)
+        matched_candidate = match_tracked_candidate(tracked_best_candidate, candidates)
+        if matched_candidate is not None and tracked_best_candidate is not None:
+            tracked_best_candidate = smooth_candidate(
+                tracked_best_candidate,
+                matched_candidate,
+                COLOR_WIDTH,
+                COLOR_HEIGHT,
+            )
+            tracked_missing_frames = 0
+        elif best_candidate is not None and tracked_best_candidate is None:
+            tracked_best_candidate = dict(best_candidate)
+            tracked_missing_frames = 0
+        elif best_candidate is not None and tracked_missing_frames > TRACK_MAX_MISSING_FRAMES:
+            tracked_best_candidate = dict(best_candidate)
+            tracked_missing_frames = 0
+        elif tracked_best_candidate is not None:
+            tracked_missing_frames += 1
+            if tracked_missing_frames > TRACK_MAX_MISSING_FRAMES:
+                tracked_best_candidate = None
+                tracked_missing_frames = 0
+
+        canny_debug_base = cv2.cvtColor(canny_edges, cv2.COLOR_GRAY2BGR)
 
         for line in raw_hough_lines:
             x1, y1, x2, y2 = line
             cv2.line(raw_hough_image, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
+        raw_hough_image = blend_debug_image(
+            previous_raw_hough_image,
+            raw_hough_image,
+            DEBUG_IMAGE_ALPHA,
+        )
+        canny_debug_image = blend_debug_image(
+            previous_canny_debug_image,
+            canny_debug_base,
+            DEBUG_IMAGE_ALPHA,
+        )
+        previous_raw_hough_image = raw_hough_image.copy()
+        previous_canny_debug_image = canny_debug_image.copy()
+
         # Draw final accepted branch candidates with distance color.
         for candidate in candidates:
             color = depth_to_branch_color(candidate["depth_m"], runtime_params)
-            thickness = 4 if candidate is best_candidate else 2
+            thickness = 2
 
             cv2.polylines(display_image, [candidate["box"]], True, color, thickness)
 
@@ -920,6 +1052,13 @@ try:
                 color,
                 2,
             )
+
+        display_best_candidate = tracked_best_candidate
+        if display_best_candidate is not None:
+            best_color = depth_to_branch_color(display_best_candidate["depth_m"], runtime_params)
+            cv2.polylines(display_image, [display_best_candidate["box"]], True, best_color, 4)
+            best_cx, best_cy = display_best_candidate["center"]
+            cv2.circle(display_image, (int(best_cx), int(best_cy)), 5, best_color, -1)
 
         close_count = sum(
             1 for c in candidates if c["depth_m"] <= runtime_params["green_threshold_m"]
@@ -990,19 +1129,19 @@ try:
             2,
         )
 
-        if best_candidate is not None:
+        if display_best_candidate is not None:
             cv2.putText(
                 display_image,
-                f"Best depth: {best_candidate['depth_m']:.2f} m",
+                f"Best depth: {display_best_candidate['depth_m']:.2f} m",
                 (10, 120),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
-                depth_to_branch_color(best_candidate["depth_m"], runtime_params),
+                depth_to_branch_color(display_best_candidate["depth_m"], runtime_params),
                 2,
             )
             cv2.putText(
                 display_image,
-                f"Length: {best_candidate['estimated_length_m'] * 39.3701:.1f} in",
+                f"Length: {display_best_candidate['estimated_length_m'] * 39.3701:.1f} in",
                 (10, 150),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
@@ -1010,14 +1149,28 @@ try:
                 2,
             )
             width_text = "Width: n/a"
-            if best_candidate.get("pair_gap_m") is not None:
-                width_text = f"Width: {best_candidate['pair_gap_m'] * 39.3701:.1f} in"
+            if display_best_candidate.get("pair_gap_m") is not None:
+                width_text = f"Width: {display_best_candidate['pair_gap_m'] * 39.3701:.1f} in"
             cv2.putText(
                 display_image,
                 width_text,
                 (10, 180),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.60,
+                (255, 255, 255),
+                2,
+            )
+            stability_text = (
+                f"Tracking: stable"
+                if tracked_missing_frames == 0
+                else f"Tracking hold: {tracked_missing_frames}"
+            )
+            cv2.putText(
+                display_image,
+                stability_text,
+                (10, 210),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
                 (255, 255, 255),
                 2,
             )
