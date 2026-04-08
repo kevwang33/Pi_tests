@@ -115,6 +115,7 @@ TRACK_MAX_MISSING_FRAMES = 4
 TRACK_MATCH_MAX_CENTER_PX = 120.0
 TRACK_MATCH_MIN_IOU = 0.05
 DEBUG_IMAGE_ALPHA = 0.35
+HOUGH_LINE_LINGER_SECONDS = 0.35
 
 
 def safe_set_option(sensor_or_filter, option, value):
@@ -911,6 +912,7 @@ tracked_best_candidate = None
 tracked_missing_frames = 0
 previous_raw_hough_image = None
 previous_canny_debug_image = None
+hough_line_history = []
 
 print("Press 'q' to quit.")
 
@@ -1016,8 +1018,23 @@ try:
         canny_debug_base = cv2.cvtColor(canny_edges, cv2.COLOR_GRAY2BGR)
 
         for line in raw_hough_lines:
+            hough_line_history.append((time.time(), line))
+
+        current_time = time.time()
+        hough_line_history = [
+            (timestamp, line)
+            for timestamp, line in hough_line_history
+            if current_time - timestamp <= HOUGH_LINE_LINGER_SECONDS
+        ]
+        for timestamp, line in hough_line_history:
             x1, y1, x2, y2 = line
-            cv2.line(raw_hough_image, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            age_ratio = np.clip(
+                (current_time - timestamp) / HOUGH_LINE_LINGER_SECONDS,
+                0.0,
+                1.0,
+            )
+            intensity = int(round(255 * (1.0 - 0.7 * age_ratio)))
+            cv2.line(raw_hough_image, (x1, y1), (x2, y2), (0, intensity, intensity), 2)
 
         raw_hough_image = blend_debug_image(
             previous_raw_hough_image,
@@ -1128,6 +1145,15 @@ try:
             (255, 255, 255),
             2,
         )
+        cv2.putText(
+            raw_hough_image,
+            f"Linger {int(round(HOUGH_LINE_LINGER_SECONDS * 1000.0))} ms",
+            (10, 55),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.50,
+            (255, 255, 255),
+            1,
+        )
 
         if display_best_candidate is not None:
             cv2.putText(
@@ -1223,7 +1249,7 @@ try:
         cv2.putText(
             raw_hough_image,
             "Raw Hough Lines",
-            (10, 60),
+            (10, 80),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.60,
             (255, 255, 255),
@@ -1235,7 +1261,7 @@ try:
                 f"Hough {runtime_params['hough_threshold']}  "
                 f"MinLen {runtime_params['hough_min_line_length']}"
             ),
-            (10, 90),
+            (10, 110),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
             (255, 255, 255),
@@ -1246,7 +1272,7 @@ try:
             (
                 f"StitchGap {runtime_params['gap_min_px']}-{runtime_params['gap_max_px']} px"
             ),
-            (10, 115),
+            (10, 135),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
             (255, 255, 255),
@@ -1258,7 +1284,7 @@ try:
                 f"PairGap {runtime_params['pair_min_gap_m'] * 39.3701:.1f}-"
                 f"{runtime_params['pair_max_gap_m'] * 39.3701:.1f} in"
             ),
-            (10, 140),
+            (10, 160),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
             (255, 255, 255),
@@ -1299,7 +1325,7 @@ try:
                 if runtime_params.get("exclude_background_hough_lines", False)
                 else "Exclude BG Hough: off"
             ),
-            (10, 165),
+            (10, 185),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
             (255, 255, 255),
