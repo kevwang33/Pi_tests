@@ -8,92 +8,136 @@ master.wait_heartbeat()
 print("Connected! Heartbeat from system %u component %u" % 
       (master.target_system, master.target_component))
 
-# --- Listen to messages for 10 seconds ---
-print("\n--- Listening for messages (10 sec) ---\n")
-start = time.time()
-while time.time() - start < 10:
-    msg = master.recv_match(blocking=True, timeout=1)
-    if msg:
-        print(f"MSG: {msg.get_type()}")
+# Print available modes
+print("\nAvailable modes:")
+print(list(master.mode_mapping().keys()))
 
-print("\n--- Done listening ---\n")
+def wait_for_ack(timeout=5):
+    """Wait for COMMAND_ACK, ignoring other messages"""
+    start = time.time()
+    while time.time() - start < timeout:
+        msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=1)
+        if msg:
+            return msg
+    return None
 
-# --- Try to set mode ---
-print("Setting mode to STABILIZE...")
-try:
-    mode_id = master.mode_mapping()['STABILIZE']
+def set_mode(mode_name):
+    """Set PX4 flight mode"""
+    if mode_name not in master.mode_mapping():
+        print(f"❌ Mode '{mode_name}' not found!")
+        print(f"Available: {list(master.mode_mapping().keys())}")
+        return False
+    mode_id = master.mode_mapping()[mode_name]
     master.set_mode(mode_id)
-    print("Mode command sent!")
-except Exception as e:
-    print(f"Mode failed: {e}")
+    print(f"Mode command sent: {mode_name}")
+    time.sleep(1)
+    # Check current mode
+    hb = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
+    if hb:
+        print(f"Current base_mode: {hb.base_mode}, custom_mode: {hb.custom_mode}")
+    return True
 
-time.sleep(2)
-
-# --- Try to arm ---
-print("\nSending ARM command...")
-master.mav.command_long_send(
-    master.target_system,
-    master.target_component,
-    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-    0,
-    1, 0, 0, 0, 0, 0, 0  # 1 = arm
-)
-
-# Wait for response with timeout
-print("Waiting for ARM response...")
-ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
-if ack:
-    print(f"ARM ACK: result = {ack.result}")
-    if ack.result == 0:
-        print("✅ ARM ACCEPTED!")
+def arm():
+    """Arm the drone (PX4)"""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        1,      # 1 = arm
+        21196,  # 21196 = force arm (bypass preflight checks)
+        0, 0, 0, 0, 0
+    )
+    ack = wait_for_ack(5)
+    if ack:
+        if ack.result == 0:
+            print("✅ ARM ACCEPTED!")
+            return True
+        else:
+            print(f"❌ ARM REJECTED (result={ack.result})")
+            return False
     else:
-        print(f"❌ ARM REJECTED (code {ack.result})")
-else:
-    print("❌ No ACK received (timeout)")
+        print("❌ No ACK received (timeout)")
+        return False
+
+def disarm():
+    """Disarm the drone (PX4)"""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0,
+        0,      # 0 = disarm
+        21196,  # 21196 = force disarm
+        0, 0, 0, 0, 0
+    )
+    ack = wait_for_ack(5)
+    if ack:
+        if ack.result == 0:
+            print("✅ DISARM ACCEPTED!")
+            return True
+        else:
+            print(f"❌ DISARM REJECTED (result={ack.result})")
+            return False
+    else:
+        print("❌ No ACK received (timeout)")
+        return False
+
+def takeoff(altitude=2):
+    """Takeoff to given altitude"""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0,
+        0, 0, 0, 0, 0, 0,
+        altitude
+    )
+    ack = wait_for_ack(5)
+    if ack:
+        if ack.result == 0:
+            print(f"✅ TAKEOFF to {altitude}m ACCEPTED!")
+        else:
+            print(f"❌ TAKEOFF REJECTED (result={ack.result})")
+    else:
+        print("❌ No ACK received (timeout)")
+
+def land():
+    """Land the drone"""
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_LAND,
+        0,
+        0, 0, 0, 0, 0, 0, 0
+    )
+    ack = wait_for_ack(5)
+    if ack:
+        if ack.result == 0:
+            print("✅ LAND ACCEPTED!")
+        else:
+            print(f"❌ LAND REJECTED (result={ack.result})")
+    else:
+        print("❌ No ACK received (timeout)")
+
+# ============================================
+# TEST SEQUENCE
+# ============================================
+
+print("\n--- Setting Mode ---")
+set_mode("MANUAL")
+
+print("\n--- Arming (force) ---")
+arm()
 
 time.sleep(3)
 
-# --- Try to takeoff ---
-print("\nSending TAKEOFF command (2m)...")
-master.mav.command_long_send(
-    master.target_system,
-    master.target_component,
-    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-    0,
-    0, 0, 0, 0, 0, 0,
-    2  # altitude in meters
-)
-
-ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
-if ack:
-    print(f"TAKEOFF ACK: result = {ack.result}")
-    if ack.result == 0:
-        print("✅ TAKEOFF ACCEPTED!")
-    else:
-        print(f"❌ TAKEOFF REJECTED (code {ack.result})")
-else:
-    print("❌ No ACK received (timeout)")
+print("\n--- Sending Takeoff ---")
+takeoff(2)
 
 time.sleep(3)
 
-# --- Disarm ---
-print("\nSending DISARM command...")
-master.mav.command_long_send(
-    master.target_system,
-    master.target_component,
-    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-    0,
-    0, 0, 0, 0, 0, 0, 0  # 0 = disarm
-)
+print("\n--- Disarming (force) ---")
+disarm()
 
-ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
-if ack:
-    print(f"DISARM ACK: result = {ack.result}")
-    if ack.result == 0:
-        print("✅ DISARM ACCEPTED!")
-    else:
-        print(f"❌ DISARM REJECTED (code {ack.result})")
-else:
-    print("❌ No ACK received (timeout)")
-
-print("\n--- Test complete ---")
+print("\n--- Test Complete ---")
