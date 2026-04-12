@@ -24,11 +24,25 @@ def wait_for_ack(timeout=5):
 def set_mode(mode_name):
     """Set PX4 flight mode"""
     if mode_name not in master.mode_mapping():
-        print(f"❌ Mode '{mode_name}' not found!")
+        print(f"Mode '{mode_name}' not found!")
         print(f"Available: {list(master.mode_mapping().keys())}")
         return False
     mode_id = master.mode_mapping()[mode_name]
-    master.set_mode(mode_id)
+    # PX4 mode_mapping returns (main_mode, sub_mode) tuples; unpack them
+    if isinstance(mode_id, tuple):
+        main_mode, sub_mode = mode_id
+    else:
+        main_mode, sub_mode = mode_id, 0
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+        0,
+        float(mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+        float(main_mode),
+        float(sub_mode),
+        0.0, 0.0, 0.0, 0.0
+    )
     print(f"Mode command sent: {mode_name}")
     time.sleep(1)
     # Check current mode
