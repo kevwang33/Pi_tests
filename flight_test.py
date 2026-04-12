@@ -2,9 +2,9 @@
 """
 PX4 Offboard flight script for Jetson Orin Nano + Holybro Pixhawk Jetson Baseboard.
 
-Connects via serial (TELEM1 → /dev/ttyTHS0 @ 921600 baud), then:
-  1. Waits for connection & GPS health
-  2. Arms
+Connects via serial (TELEM2 → /dev/ttyTHS1 @ 921600 baud), then:
+  1. Waits for connection
+  2. Force-arms (bypasses pre-arm checks)
   3. Enters offboard mode and takes off to 3 m
   4. Yaws 90° (faces East)
   5. Lands and disarms
@@ -61,19 +61,16 @@ async def run():
             print("-- Connected to drone!")
             break
 
-    print("Waiting for global position estimate...")
-    async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
-            print("-- Global position estimate OK")
-            break
+    # ── 1. Force-arm (bypasses pre-arm checks like GPS) ────────────
+    print("-- Force-arming (bypassing pre-arm checks)")
+    await drone.action.set_force_arm(True)
+    await drone.action.arm()
 
-    # ── 1. Set an initial setpoint BEFORE starting offboard ──────────
-    # PX4 requires at least one setpoint to exist; without it offboard
-    # start is rejected with NO_SETPOINT_SET.
+    # ── 2. Set an initial setpoint BEFORE starting offboard ──────────
     print("-- Setting initial offboard setpoint")
     await drone.offboard.set_position_ned(PositionNedYaw(0.0, 0.0, 0.0, 0.0))
 
-    # ── 2. Start offboard mode ───────────────────────────────────────
+    # ── 3. Start offboard mode ───────────────────────────────────────
     print("-- Starting offboard mode")
     try:
         await drone.offboard.start()
@@ -83,10 +80,6 @@ async def run():
         await drone.action.disarm()
         status_task.cancel()
         return
-
-    # ── 3. Arm ───────────────────────────────────────────────────────
-    print("-- Arming")
-    await drone.action.arm()
 
     # ── 4. Take off to 3 m (NED: z = -3) ────────────────────────────
     print(f"-- Climbing to {TAKEOFF_ALT} m")
