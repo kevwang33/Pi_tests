@@ -63,8 +63,7 @@ async def run():
 
     # ── 1. Force-arm (bypasses pre-arm checks like GPS) ────────────
     print("-- Force-arming (bypassing pre-arm checks)")
-    await drone.action.set_force_arm(True)
-    await drone.action.arm()
+    await drone.action.arm_force()
 
     # ── 2. Set an initial setpoint BEFORE starting offboard ──────────
     print("-- Setting initial offboard setpoint")
