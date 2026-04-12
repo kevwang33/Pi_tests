@@ -1,16 +1,26 @@
 from pymavlink import mavutil
 import time
 import threading
+import os
 
-# Identify ourselves as a GCS: system 255, component 190 (MAV_COMP_ID_MISSIONPLANNER)
 SRC_SYSTEM = 255
 SRC_COMPONENT = 190
 
-print("Connecting...")
+SERIAL_PORT = os.environ.get('MAV_PORT', '/dev/ttyTHS1')
+BAUD = int(os.environ.get('MAV_BAUD', '57600'))
+
+send_lock = threading.Lock()
+
+print(f"Connecting on {SERIAL_PORT} @ {BAUD} …")
 master = mavutil.mavlink_connection(
-    '/dev/ttyTHS1', baud=57600,
+    SERIAL_PORT, baud=BAUD,
     source_system=SRC_SYSTEM, source_component=SRC_COMPONENT,
 )
+
+# Force MAVLink 2 framing (PX4 defaults to v2 on most ports)
+master.mav.WIRE_PROTOCOL_VERSION = '2.0'
+os.environ['MAVLINK20'] = '1'
+
 master.wait_heartbeat()
 print("Connected! Heartbeat from system %u component %u" %
       (master.target_system, master.target_component))
@@ -19,40 +29,77 @@ if master.target_component != 1:
     print(f"Overriding target_component {master.target_component} → 1 (autopilot)")
     master.target_component = 1
 
-print(f"GCS identity: system={SRC_SYSTEM} component={SRC_COMPONENT}")
-print(f"Target:       system={master.target_system} component={master.target_component}")
+print(f"GCS identity:  sys={SRC_SYSTEM}  comp={SRC_COMPONENT}")
+print(f"Target:        sys={master.target_system}  comp={master.target_component}")
+print(f"MAVLink wire:  {master.mav.WIRE_PROTOCOL_VERSION}")
 
-# Background thread: send GCS heartbeats so PX4 recognises us as a command source
+# ------------------------------------------------------------------
+# Background GCS heartbeat (thread-safe)
+# ------------------------------------------------------------------
 _hb_stop = threading.Event()
 
 def _heartbeat_loop():
     while not _hb_stop.is_set():
-        master.mav.heartbeat_send(
-            mavutil.mavlink.MAV_TYPE_GCS,
-            mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-            0, 0, 0,
-        )
+        with send_lock:
+            master.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0, 0, 0,
+            )
         time.sleep(1)
 
 _hb_thread = threading.Thread(target=_heartbeat_loop, daemon=True)
 _hb_thread.start()
 
-# Give PX4 a couple of heartbeats before we start commanding
-print("Sending GCS heartbeats … waiting for PX4 to register us")
+print("Sending GCS heartbeats …")
 time.sleep(3)
 
+# ------------------------------------------------------------------
+# Bidirectional link test — request a single parameter
+# ------------------------------------------------------------------
+print("\n--- Link Test: requesting param SYS_AUTOSTART ---")
+flush_start = time.time()
+while master.recv_match(blocking=False):
+    pass
+print(f"  buffer flushed in {time.time() - flush_start:.2f}s")
+
+with send_lock:
+    master.mav.param_request_read_send(
+        master.target_system, master.target_component,
+        b'SYS_AUTOSTART', -1,
+    )
+
+param = master.recv_match(type='PARAM_VALUE', blocking=True, timeout=5)
+if param:
+    print(f"  ✅ Link OK — {param.param_id.rstrip(chr(0))} = {param.param_value}")
+else:
+    print("  ❌ No PARAM_VALUE response!")
+    print()
+    print("  PX4 is NOT responding to messages from the Jetson.")
+    print("  Likely causes:")
+    print("    1) TX wiring: Jetson TX is not connected to Pixhawk RX")
+    print("    2) Wrong port: try  MAV_PORT=/dev/ttyTHS2 python basic_flight.py")
+    print("    3) Baud mismatch: try  MAV_BAUD=921600 python basic_flight.py")
+    print("    4) PX4 serial port not configured for MAVLink")
+    print("       → in QGC set MAV_1_CONFIG (or MAV_2_CONFIG) to the TELEM port wired to the Jetson")
+    print("    5) Permission issue: run  sudo chmod 666 /dev/ttyTHS1")
+    print()
+    print("  Continuing anyway to show what happens …")
+    print()
+
+# ------------------------------------------------------------------
 print("\nAvailable modes:")
 print(list(master.mode_mapping().keys()))
 
+# ------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------
 def flush_buffer():
-    """Drain any queued incoming messages before sending a command."""
     while master.recv_match(blocking=False):
         pass
 
-def wait_for_ack(cmd_id, timeout=10):
-    """Wait for COMMAND_ACK matching cmd_id; summarise other traffic."""
+def wait_for_ack(cmd_id, timeout=5):
     start = time.time()
-    other_counts = {}
     while time.time() - start < timeout:
         msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=0.5)
         if msg is None:
@@ -60,33 +107,29 @@ def wait_for_ack(cmd_id, timeout=10):
         print(f"  [ACK] command={msg.command} result={msg.result}")
         if msg.command == cmd_id:
             return msg
-    if other_counts:
-        print(f"  (received {sum(other_counts.values())} other messages, no matching ACK)")
     return None
 
 def send_command_long(cmd_id, p1=0, p2=0, p3=0, p4=0, p5=0, p6=0, p7=0,
                       retries=3, timeout=5):
-    """Send COMMAND_LONG with retries (re-transmit using the confirmation field)."""
     for attempt in range(retries):
         flush_buffer()
-        master.mav.command_long_send(
-            master.target_system,
-            master.target_component,
-            cmd_id,
-            attempt,          # confirmation counter (0, 1, 2 …)
-            p1, p2, p3, p4, p5, p6, p7,
-        )
+        with send_lock:
+            master.mav.command_long_send(
+                master.target_system,
+                master.target_component,
+                cmd_id,
+                attempt,
+                p1, p2, p3, p4, p5, p6, p7,
+            )
         ack = wait_for_ack(cmd_id, timeout=timeout)
         if ack is not None:
             return ack
-        print(f"  (retry {attempt + 1}/{retries})")
+        print(f"  (no ACK – attempt {attempt + 1}/{retries})")
     return None
 
 def set_mode(mode_name):
-    """Set PX4 flight mode."""
     if mode_name not in master.mode_mapping():
         print(f"Mode '{mode_name}' not found!")
-        print(f"Available: {list(master.mode_mapping().keys())}")
         return False
     mode_id = master.mode_mapping()[mode_name]
     if isinstance(mode_id, (list, tuple)):
@@ -100,20 +143,18 @@ def set_mode(mode_name):
         p1=float(base_mode), p2=float(main_mode), p3=float(sub_mode),
     )
     if ack:
-        print(f"Mode set result: {ack.result} ({'OK' if ack.result == 0 else 'FAIL'})")
+        print(f"Mode result: {ack.result} ({'OK' if ack.result == 0 else 'FAIL'})")
     else:
-        print("⚠  No ACK for set_mode – checking heartbeat for actual mode")
+        print("⚠  No ACK for set_mode")
     hb = master.recv_match(type='HEARTBEAT', blocking=True, timeout=3)
     if hb:
         print(f"Current base_mode: {hb.base_mode}, custom_mode: {hb.custom_mode}")
     return True
 
 def arm(force=True):
-    """Arm the drone (PX4)."""
     ack = send_command_long(
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        p1=1,                        # 1 = arm
-        p2=21196 if force else 0,    # magic number to bypass pre-flight checks
+        p1=1, p2=21196 if force else 0,
     )
     if ack:
         if ack.result == 0:
@@ -125,11 +166,9 @@ def arm(force=True):
     return False
 
 def disarm(force=True):
-    """Disarm the drone (PX4)."""
     ack = send_command_long(
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        p1=0,                        # 0 = disarm
-        p2=21196 if force else 0,
+        p1=0, p2=21196 if force else 0,
     )
     if ack:
         if ack.result == 0:
@@ -141,11 +180,7 @@ def disarm(force=True):
     return False
 
 def takeoff(altitude=2):
-    """Takeoff to given altitude."""
-    ack = send_command_long(
-        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        p7=altitude,
-    )
+    ack = send_command_long(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, p7=altitude)
     if ack:
         if ack.result == 0:
             print(f"✅ TAKEOFF to {altitude}m ACCEPTED!")
@@ -155,7 +190,6 @@ def takeoff(altitude=2):
         print("❌ No ACK received (timeout)")
 
 def land():
-    """Land the drone."""
     ack = send_command_long(mavutil.mavlink.MAV_CMD_NAV_LAND)
     if ack:
         if ack.result == 0:
