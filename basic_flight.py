@@ -28,9 +28,11 @@ def set_mode(mode_name):
         print(f"Available: {list(master.mode_mapping().keys())}")
         return False
     mode_id = master.mode_mapping()[mode_name]
-    # PX4 mode_mapping returns (main_mode, sub_mode) tuples; unpack them
-    if isinstance(mode_id, tuple):
-        main_mode, sub_mode = mode_id
+    print(f"mode_id raw value: {mode_id!r}")
+    # PX4 mode_mapping may return an int, a 2-tuple, or a 3-tuple
+    if isinstance(mode_id, (list, tuple)):
+        main_mode = mode_id[0]
+        sub_mode = mode_id[1] if len(mode_id) > 1 else 0
     else:
         main_mode, sub_mode = mode_id, 0
     master.mav.command_long_send(
