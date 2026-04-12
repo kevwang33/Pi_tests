@@ -5,20 +5,35 @@ import time
 print("Connecting...")
 master = mavutil.mavlink_connection('/dev/ttyTHS1', baud=57600)
 master.wait_heartbeat()
-print("Connected! Heartbeat from system %u component %u" % 
+print("Connected! Heartbeat from system %u component %u" %
       (master.target_system, master.target_component))
+
+# PX4 autopilot is always component 1; override if wait_heartbeat picked up
+# a broadcast (component 0) or a relay instead of the autopilot directly.
+if master.target_component != 1:
+    print(f"Overriding target_component {master.target_component} → 1 (autopilot)")
+    master.target_component = 1
 
 # Print available modes
 print("\nAvailable modes:")
 print(list(master.mode_mapping().keys()))
 
-def wait_for_ack(timeout=5):
-    """Wait for COMMAND_ACK, ignoring other messages"""
+def flush_buffer():
+    """Drain any queued incoming messages before sending a command."""
+    while master.recv_match(blocking=False):
+        pass
+
+def wait_for_ack(timeout=10):
+    """Wait for COMMAND_ACK; print any other messages received while waiting."""
     start = time.time()
     while time.time() - start < timeout:
-        msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=1)
-        if msg:
+        msg = master.recv_match(blocking=True, timeout=1)
+        if msg is None:
+            continue
+        if msg.get_type() == 'COMMAND_ACK':
             return msg
+        # Show unexpected messages to help diagnose communication issues
+        print(f"  [recv] {msg.get_type()}")
     return None
 
 def set_mode(mode_name):
@@ -28,19 +43,21 @@ def set_mode(mode_name):
         print(f"Available: {list(master.mode_mapping().keys())}")
         return False
     mode_id = master.mode_mapping()[mode_name]
-    print(f"mode_id raw value: {mode_id!r}")
-    # PX4 mode_mapping may return an int, a 2-tuple, or a 3-tuple
+    # PX4 mode_mapping returns (base_mode, main_mode, sub_mode);
+    # MAV_CMD_DO_SET_MODE param1=base_mode, param2=main_mode, param3=sub_mode
     if isinstance(mode_id, (list, tuple)):
-        main_mode = mode_id[0]
-        sub_mode = mode_id[1] if len(mode_id) > 1 else 0
+        base_mode = mode_id[0]
+        main_mode = mode_id[1] if len(mode_id) > 1 else 0
+        sub_mode  = mode_id[2] if len(mode_id) > 2 else 0
     else:
-        main_mode, sub_mode = mode_id, 0
+        base_mode, main_mode, sub_mode = mode_id, 0, 0
+    flush_buffer()
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
         mavutil.mavlink.MAV_CMD_DO_SET_MODE,
         0,
-        float(mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED),
+        float(base_mode),
         float(main_mode),
         float(sub_mode),
         0.0, 0.0, 0.0, 0.0
@@ -55,6 +72,7 @@ def set_mode(mode_name):
 
 def arm():
     """Arm the drone (PX4)"""
+    flush_buffer()
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
@@ -78,6 +96,7 @@ def arm():
 
 def disarm():
     """Disarm the drone (PX4)"""
+    flush_buffer()
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
@@ -101,6 +120,7 @@ def disarm():
 
 def takeoff(altitude=2):
     """Takeoff to given altitude"""
+    flush_buffer()
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
@@ -120,6 +140,7 @@ def takeoff(altitude=2):
 
 def land():
     """Land the drone"""
+    flush_buffer()
     master.mav.command_long_send(
         master.target_system,
         master.target_component,
