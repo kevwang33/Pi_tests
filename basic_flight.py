@@ -203,8 +203,8 @@ def land():
 # TEST SEQUENCE
 # ============================================
 try:
-    print("\n--- Setting Mode ---")
-    set_mode("MANUAL")
+    print("\n--- Setting Mode: OFFBOARD ---")
+    set_mode("OFFBOARD")
 
     print("\n--- Arming (force) ---")
     arm()
