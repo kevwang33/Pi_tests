@@ -8,93 +8,92 @@ master.wait_heartbeat()
 print("Connected! Heartbeat from system %u component %u" % 
       (master.target_system, master.target_component))
 
-def set_mode(mode):
-    """Set flight mode (e.g., STABILIZE, OFFBOARD, MANUAL)"""
-    mode_id = master.mode_mapping()[mode]
-    master.set_mode(mode_id)
-    print(f"Mode set to {mode}")
-
-def arm():
-    """Arm the drone"""
-    master.arducopter_arm()
-    master.motors_armed_wait()
-    print("Armed!")
-
-def disarm():
-    """Disarm the drone"""
-    master.arducopter_disarm()
-    master.motors_disarmed_wait()
-    print("Disarmed!")
-
-def takeoff(altitude=2):
-    """Takeoff to given altitude in meters"""
-    master.mav.command_long_send(
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        0,       # confirmation
-        0, 0, 0, 0, 0, 0,
-        altitude  # target altitude
-    )
-    print(f"Taking off to {altitude}m...")
-
-def land():
-    """Land the drone"""
-    master.mav.command_long_send(
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_LAND,
-        0,
-        0, 0, 0, 0, 0, 0, 0
-    )
-    print("Landing...")
-
-def goto(lat, lon, alt):
-    """Go to GPS position"""
-    master.mav.set_position_target_global_int_send(
-        0,  # time_boot_ms
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0b0000111111111000,  # type_mask (only positions)
-        int(lat * 1e7),
-        int(lon * 1e7),
-        alt,
-        0, 0, 0,  # velocity
-        0, 0, 0,  # acceleration
-        0, 0      # yaw, yaw_rate
-    )
-    print(f"Going to lat={lat}, lon={lon}, alt={alt}m")
-
-def get_position():
-    """Get current GPS position"""
-    msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=5)
+# --- Listen to messages for 10 seconds ---
+print("\n--- Listening for messages (10 sec) ---\n")
+start = time.time()
+while time.time() - start < 10:
+    msg = master.recv_match(blocking=True, timeout=1)
     if msg:
-        lat = msg.lat / 1e7
-        lon = msg.lon / 1e7
-        alt = msg.relative_alt / 1000
-        print(f"Position: lat={lat}, lon={lon}, alt={alt}m")
-        return lat, lon, alt
-    return None
+        print(f"MSG: {msg.get_type()}")
 
-# ============================================
-# TEST SEQUENCE (props off!)
-# ============================================
+print("\n--- Done listening ---\n")
 
-# Step 1: Check position
-get_position()
+# --- Try to set mode ---
+print("Setting mode to STABILIZE...")
+try:
+    mode_id = master.mode_mapping()['STABILIZE']
+    master.set_mode(mode_id)
+    print("Mode command sent!")
+except Exception as e:
+    print(f"Mode failed: {e}")
 
-# Step 2: Arm
-arm()
 time.sleep(2)
 
-# Step 3: Disarm
-disarm()
+# --- Try to arm ---
+print("\nSending ARM command...")
+master.mav.command_long_send(
+    master.target_system,
+    master.target_component,
+    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+    0,
+    1, 0, 0, 0, 0, 0, 0  # 1 = arm
+)
 
-# ----- ONLY DO BELOW OUTDOORS WITH PROPS ON AND RC READY -----
-# set_mode("OFFBOARD")  # or "GUIDED" for ArduPilot
-# arm()
-# time.sleep(2)
-# takeoff(2)
-# time.sleep(10)
-# land()
+# Wait for response with timeout
+print("Waiting for ARM response...")
+ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+if ack:
+    print(f"ARM ACK: result = {ack.result}")
+    if ack.result == 0:
+        print("✅ ARM ACCEPTED!")
+    else:
+        print(f"❌ ARM REJECTED (code {ack.result})")
+else:
+    print("❌ No ACK received (timeout)")
+
+time.sleep(3)
+
+# --- Try to takeoff ---
+print("\nSending TAKEOFF command (2m)...")
+master.mav.command_long_send(
+    master.target_system,
+    master.target_component,
+    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+    0,
+    0, 0, 0, 0, 0, 0,
+    2  # altitude in meters
+)
+
+ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+if ack:
+    print(f"TAKEOFF ACK: result = {ack.result}")
+    if ack.result == 0:
+        print("✅ TAKEOFF ACCEPTED!")
+    else:
+        print(f"❌ TAKEOFF REJECTED (code {ack.result})")
+else:
+    print("❌ No ACK received (timeout)")
+
+time.sleep(3)
+
+# --- Disarm ---
+print("\nSending DISARM command...")
+master.mav.command_long_send(
+    master.target_system,
+    master.target_component,
+    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+    0,
+    0, 0, 0, 0, 0, 0, 0  # 0 = disarm
+)
+
+ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+if ack:
+    print(f"DISARM ACK: result = {ack.result}")
+    if ack.result == 0:
+        print("✅ DISARM ACCEPTED!")
+    else:
+        print(f"❌ DISARM REJECTED (code {ack.result})")
+else:
+    print("❌ No ACK received (timeout)")
+
+print("\n--- Test complete ---")
