@@ -2,7 +2,7 @@
 """
 PX4 Offboard flight script for Jetson Orin Nano + Holybro Pixhawk Jetson Baseboard.
 
-Connects via serial (TELEM2 → /dev/ttyTHS1 @ 921600 baud), then:
+Connects via serial (TELEM1 → /dev/ttyTHS0 @ 921600 baud), then:
   1. Waits for connection & GPS health
   2. Arms
   3. Enters offboard mode and takes off to 3 m
@@ -18,7 +18,7 @@ from mavsdk.offboard import OffboardError, PositionNedYaw
 
 logging.basicConfig(level=logging.INFO)
 
-SERIAL_ADDRESS = "serial:///dev/ttyTHS1:921600"
+SERIAL_ADDRESS = "serial:///dev/ttyTHS0:921600"
 TAKEOFF_ALT = 3.0          # metres (NED ⇒ -3.0 m down)
 YAW_TARGET = 90.0           # degrees – face East
 CLIMB_SETTLE_S = 10         # seconds to wait after climb command
