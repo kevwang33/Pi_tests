@@ -11,9 +11,6 @@ async def test():
             print("Connected!")
             break
 
-    # Set manual mode first (no GPS needed)
-    await drone.action.set_flight_mode(1)  # MANUAL
-
     print("Attempting force-arm...")
     await drone.action.arm_force()
     print("Armed!")
