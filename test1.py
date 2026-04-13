@@ -3,7 +3,7 @@ from mavsdk import System
 
 async def test():
     drone = System()
-    await drone.connect(system_address="serial:///dev/ttyTHS1:921600")
+    await drone.connect(system_address="serial:///dev/ttyTHS1:115200")
 
     print("Waiting for connection...")
     async for state in drone.core.connection_state():
