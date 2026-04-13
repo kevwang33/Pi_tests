@@ -2,7 +2,7 @@ import serial
 import time
 
 PORT = '/dev/ttyTHS1'
-BAUD = 921600
+BAUD = 115200
 
 ser = serial.Serial(PORT, BAUD, timeout=1)
 print(f"Opened {PORT} @ {BAUD}")
