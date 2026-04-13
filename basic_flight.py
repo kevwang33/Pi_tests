@@ -7,7 +7,7 @@ SRC_SYSTEM = 255
 SRC_COMPONENT = 190
 
 SERIAL_PORT = os.environ.get('MAV_PORT', '/dev/ttyTHS1')
-BAUD = int(os.environ.get('MAV_BAUD', '57600'))
+BAUD = int(os.environ.get('MAV_BAUD', '921600'))
 
 send_lock = threading.Lock()
 
@@ -79,13 +79,65 @@ else:
     print("  Likely causes:")
     print("    1) TX wiring: Jetson TX is not connected to Pixhawk RX")
     print("    2) Wrong port: try  MAV_PORT=/dev/ttyTHS2 python basic_flight.py")
-    print("    3) Baud mismatch: try  MAV_BAUD=921600 python basic_flight.py")
+    print("    3) Baud mismatch: try  MAV_BAUD=57600 python basic_flight.py")
     print("    4) PX4 serial port not configured for MAVLink")
     print("       → in QGC set MAV_1_CONFIG (or MAV_2_CONFIG) to the TELEM port wired to the Jetson")
     print("    5) Permission issue: run  sudo chmod 666 /dev/ttyTHS1")
     print()
     print("  Continuing anyway to show what happens …")
     print()
+
+# ------------------------------------------------------------------
+# MAVLink serial-port configuration diagnostic
+# ------------------------------------------------------------------
+def _read_param(name, timeout=3):
+    """Request a single param by name; returns value or None."""
+    while master.recv_match(blocking=False):
+        pass
+    with send_lock:
+        master.mav.param_request_read_send(
+            master.target_system, master.target_component,
+            name.encode('utf-8') if isinstance(name, str) else name, -1,
+        )
+    msg = master.recv_match(type='PARAM_VALUE', blocking=True, timeout=timeout)
+    if msg and msg.param_id.rstrip(chr(0)) == name:
+        return msg.param_value
+    return None
+
+TELEM_PORT_CODES = {
+    0: "Disabled",
+    101: "TELEM1 (/dev/ttyS1)",
+    102: "TELEM2 (/dev/ttyS2)",
+    103: "TELEM3 (/dev/ttyS3)",
+    104: "TELEM4 (UART/I2C)",
+    201: "GPS1",
+    202: "GPS2",
+    300: "Radio Controller",
+    401: "Wifi Port",
+    1000: "Ethernet",
+}
+
+if param:
+    print("\n--- MAVLink Serial Port Config ---")
+    for mav_inst in ("MAV_0_CONFIG", "MAV_1_CONFIG", "MAV_2_CONFIG"):
+        val = _read_param(mav_inst)
+        if val is not None:
+            code = int(val)
+            label = TELEM_PORT_CODES.get(code, f"unknown ({code})")
+            print(f"  {mav_inst} = {code}  →  {label}")
+        else:
+            print(f"  {mav_inst} = (not found)")
+
+    baud_val = _read_param("SER_TEL2_BAUD")
+    if baud_val is not None:
+        px4_baud = int(baud_val)
+        match = "✅" if px4_baud == BAUD else f"❌ MISMATCH (script uses {BAUD})"
+        print(f"  SER_TEL2_BAUD = {px4_baud}  {match}")
+    else:
+        print("  SER_TEL2_BAUD = (not found)")
+    print()
+else:
+    print("  (skipping config reads — link test already failed)\n")
 
 # ------------------------------------------------------------------
 print("\nAvailable modes:")

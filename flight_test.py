@@ -3,11 +3,12 @@
 PX4 Offboard flight script for Jetson Orin Nano + Holybro Pixhawk Jetson Baseboard.
 
 Connects via serial (TELEM2 → /dev/ttyTHS1 @ 921600 baud), then:
-  1. Waits for connection
-  2. Force-arms (bypasses pre-arm checks)
-  3. Enters offboard mode and takes off to 3 m
-  4. Yaws 90° (faces East)
-  5. Lands and disarms
+  1. Waits for connection and global position estimate
+  2. Sends initial offboard setpoint (hold position)
+  3. Starts offboard mode
+  4. Force-arms (bypasses pre-arm checks)
+  5. Takes off to 3 m, yaws 90° (faces East)
+  6. Lands and disarms
 """
 
 import asyncio
@@ -61,24 +62,22 @@ async def run():
             print("-- Connected to drone!")
             break
 
-    # ── 1. Force-arm (bypasses pre-arm checks like GPS) ────────────
-    print("-- Force-arming (bypassing pre-arm checks)")
-    await drone.action.arm_force()
-
-    # ── 2. Set an initial setpoint BEFORE starting offboard ──────────
+    # ── 1. Set an initial setpoint BEFORE starting offboard ──────────
     print("-- Setting initial offboard setpoint")
     await drone.offboard.set_position_ned(PositionNedYaw(0.0, 0.0, 0.0, 0.0))
 
-    # ── 3. Start offboard mode ───────────────────────────────────────
+    # ── 2. Start offboard mode ───────────────────────────────────────
     print("-- Starting offboard mode")
     try:
         await drone.offboard.start()
     except OffboardError as e:
         print(f"Offboard start failed: {e._result.result}")
-        print("-- Disarming")
-        await drone.action.disarm()
         status_task.cancel()
         return
+
+    # ── 3. Force-arm (bypasses pre-arm checks like GPS) ──────────────
+    print("-- Force-arming (bypassing pre-arm checks)")
+    await drone.action.arm_force()
 
     # ── 4. Take off to 3 m (NED: z = -3) ────────────────────────────
     print(f"-- Climbing to {TAKEOFF_ALT} m")
@@ -87,7 +86,7 @@ async def run():
     )
     await asyncio.sleep(CLIMB_SETTLE_S)
 
-    # ── 5. Yaw 90° while holding position ───────────────────────────
+    # ── 5. Yaw 90° while holding position ──────────────────────────
     print(f"-- Yawing to {YAW_TARGET}°")
     await drone.offboard.set_position_ned(
         PositionNedYaw(0.0, 0.0, -TAKEOFF_ALT, YAW_TARGET)
