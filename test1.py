@@ -24,7 +24,7 @@ async def test():
     # Read health to see what's available
     async for health in drone.telemetry.health():
         print(f"Accelerometer ok: {health.is_accelerometer_calibration_ok}")
-        print(f"Gyroscope ok: {health.is_gyroscope_calibration_ok}")
+        print(f"Gyroscope ok: {health.is_gyrometer_calibration_ok}")
         print(f"Magnetometer ok: {health.is_magnetometer_calibration_ok}")
         print(f"GPS ok: {health.is_global_position_ok}")
         print(f"Armable: {health.is_armable}")
