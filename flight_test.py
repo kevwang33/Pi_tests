@@ -19,7 +19,7 @@ from mavsdk.offboard import OffboardError, PositionNedYaw
 
 logging.basicConfig(level=logging.INFO)
 
-SERIAL_ADDRESS = "serial:///dev/ttyTHS1:115200"
+SERIAL_ADDRESS = "serial:///dev/ttyACM0:115200"
 TAKEOFF_ALT = 3.0          # metres (NED ⇒ -3.0 m down)
 YAW_TARGET = 90.0           # degrees – face East
 CLIMB_SETTLE_S = 10         # seconds to wait after climb command
