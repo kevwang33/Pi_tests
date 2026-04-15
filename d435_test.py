@@ -1,12 +1,13 @@
+import asyncio
 import cv2
-import math
 import numpy as np
 import os
 import serial
 import threading
 import time
 
-from pymavlink import mavutil
+from mavsdk import System
+from mavsdk.offboard import OffboardError, PositionNedYaw
 from param_gui import ParamGUI
 
 try:
@@ -125,15 +126,17 @@ HOUGH_LINE_LINGER_SECONDS = 0.35
 HOUGH_LINE_COMPUTE_LINGER_SECONDS = 0.30
 
 # -----------------------------
-# Flight control (pymavlink)
+# Flight control (MAVSDK)
 # -----------------------------
-PIXHAWK_PORT = os.environ.get('MAV_PORT', '/dev/ttyTHS1')
-PIXHAWK_BAUD = int(os.environ.get('MAV_BAUD', '57600'))
-FLIGHT_SRC_SYSTEM = 255
-FLIGHT_SRC_COMPONENT = 190
+SERIAL_ADDRESS = os.environ.get(
+    'MAV_ADDRESS',
+    f"serial://{os.environ.get('MAV_PORT', '/dev/ttyTHS1')}:"
+    f"{os.environ.get('MAV_BAUD', '57600')}",
+)
 HOVER_ALTITUDE_M = 2.0
 SEARCH_YAW_RATE_DEG_S = 15.0
 LOCK_LOST_TIMEOUT_S = 2.0
+HEALTH_TIMEOUT_S = 30
 
 
 def safe_set_option(sensor_or_filter, option, value):
@@ -665,149 +668,87 @@ def match_tracked_candidate(tracked_candidate, candidates):
 
 
 # ---------------------------------------------------------------------------
-# pymavlink flight helpers
+# MAVSDK flight controller (sync wrapper for async API)
 # ---------------------------------------------------------------------------
-_mav_send_lock = threading.Lock()
-_hb_stop = threading.Event()
+class FlightController:
+    """Runs an asyncio event loop on a background thread so the synchronous
+    OpenCV main loop can call MAVSDK without becoming async itself."""
 
+    def __init__(self, address):
+        self._address = address
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+        self._drone = System()
+        self.connected = False
 
-def _heartbeat_loop(master):
-    while not _hb_stop.is_set():
-        with _mav_send_lock:
-            master.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_GCS,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                0, 0, 0,
-            )
-        time.sleep(1)
+    def _run(self, coro, timeout=30):
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=timeout)
 
+    def connect(self, timeout=15):
+        self._run(self._drone.connect(system_address=self._address), timeout=timeout)
 
-def mav_flush(master):
-    while master.recv_match(blocking=False):
-        pass
+        async def _wait_connected():
+            async for state in self._drone.core.connection_state():
+                if state.is_connected:
+                    return
 
+        self._run(_wait_connected(), timeout=timeout)
+        self.connected = True
+        print(f"Connected to drone via {self._address}")
 
-def mav_wait_for_ack(master, cmd_id, timeout=5):
-    start = time.time()
-    while time.time() - start < timeout:
-        msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=0.5)
-        if msg is None:
-            continue
-        if msg.command == cmd_id:
-            return msg
-    return None
+    def wait_for_position(self, timeout=HEALTH_TIMEOUT_S):
+        print(f"Waiting for valid local position estimate (timeout {timeout}s)...")
 
+        async def _wait():
+            elapsed = 0.0
+            async for health in self._drone.telemetry.health():
+                if health.is_local_position_ok:
+                    print("Local position estimate OK")
+                    return True
+                await asyncio.sleep(1.0)
+                elapsed += 1.0
+                if elapsed >= timeout:
+                    print("TIMEOUT: No local position estimate.")
+                    print("Check GPS lock or external position source (MOCAP/optical flow).")
+                    return False
 
-def mav_command_long(master, cmd_id, p1=0, p2=0, p3=0, p4=0, p5=0, p6=0, p7=0,
-                     retries=3, timeout=5):
-    for attempt in range(retries):
-        mav_flush(master)
-        with _mav_send_lock:
-            master.mav.command_long_send(
-                master.target_system,
-                master.target_component,
-                cmd_id,
-                attempt,
-                p1, p2, p3, p4, p5, p6, p7,
-            )
-        ack = mav_wait_for_ack(master, cmd_id, timeout=timeout)
-        if ack is not None:
-            return ack
-    return None
+        return self._run(_wait(), timeout=timeout + 5)
 
+    def start_offboard(self):
+        print("Setting initial offboard setpoint...")
+        self._run(self._drone.offboard.set_position_ned(
+            PositionNedYaw(0.0, 0.0, 0.0, 0.0)))
+        print("Starting offboard mode...")
+        self._run(self._drone.offboard.start())
+        print("Offboard mode active")
 
-def mav_wait_for_position(master, timeout=30):
-    """Wait until PX4's EKF has a valid local position estimate."""
-    print(f"Waiting for valid local position estimate (timeout {timeout}s)...")
-    start = time.time()
-    while time.time() - start < timeout:
-        msg = master.recv_match(type='LOCAL_POSITION_NED', blocking=True, timeout=2)
-        if msg is not None:
-            print(f"Local position OK: x={msg.x:.1f} y={msg.y:.1f} z={msg.z:.1f}")
-            return True
-    print("TIMEOUT: No local position estimate. Offboard position commands will NOT work.")
-    print("Check GPS lock or external position source (MOCAP/optical flow).")
-    return False
-
-
-def mav_set_mode(master, mode_name):
-    if mode_name not in master.mode_mapping():
-        print(f"Mode '{mode_name}' not found!")
-        return False
-    mode_id = master.mode_mapping()[mode_name]
-    if isinstance(mode_id, (list, tuple)):
-        base_mode = mode_id[0]
-        main_mode = mode_id[1] if len(mode_id) > 1 else 0
-        sub_mode = mode_id[2] if len(mode_id) > 2 else 0
-    else:
-        base_mode, main_mode, sub_mode = mode_id, 0, 0
-    ack = mav_command_long(
-        master,
-        mavutil.mavlink.MAV_CMD_DO_SET_MODE,
-        p1=float(base_mode), p2=float(main_mode), p3=float(sub_mode),
-    )
-    if ack and ack.result == 0:
-        print(f"Mode set to {mode_name}")
-        return True
-    print(f"Failed to set mode {mode_name}")
-    return False
-
-
-def mav_arm(master, force=True):
-    ack = mav_command_long(
-        master,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        p1=1, p2=21196 if force else 0,
-    )
-    if ack and ack.result == 0:
+    def arm(self):
+        print("Arming...")
+        self._run(self._drone.action.arm())
         print("Armed!")
-        return True
-    print("Arm failed")
-    return False
 
+    def set_position_yaw(self, n, e, d, yaw_deg):
+        self._run(self._drone.offboard.set_position_ned(
+            PositionNedYaw(n, e, d, yaw_deg)), timeout=5)
 
-def mav_disarm(master, force=True):
-    ack = mav_command_long(
-        master,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        p1=0, p2=21196 if force else 0,
-    )
-    if ack and ack.result == 0:
+    def land(self):
+        print("Landing...")
+        try:
+            self._run(self._drone.offboard.stop(), timeout=5)
+        except Exception:
+            pass
+        self._run(self._drone.action.land())
+        print("Land command sent")
+
+    def disarm(self):
+        print("Disarming...")
+        self._run(self._drone.action.disarm())
         print("Disarmed!")
-        return True
-    print("Disarm failed")
-    return False
 
-
-def mav_land(master):
-    ack = mav_command_long(master, mavutil.mavlink.MAV_CMD_NAV_LAND)
-    if ack and ack.result == 0:
-        print("Land accepted")
-        return True
-    print("Land failed")
-    return False
-
-
-def send_offboard_setpoint(master, x, y, z, yaw_rate_rad):
-    """Position hold with yaw rate. z is NED (negative = up)."""
-    type_mask = (
-        (1 << 3) | (1 << 4) | (1 << 5) |  # ignore velocity
-        (1 << 6) | (1 << 7) | (1 << 8) |   # ignore acceleration
-        (1 << 10)                            # ignore yaw (use yaw_rate)
-    )
-    with _mav_send_lock:
-        master.mav.set_position_target_local_ned_send(
-            0,
-            master.target_system,
-            master.target_component,
-            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
-            type_mask,
-            x, y, z,
-            0, 0, 0,
-            0, 0, 0,
-            0,
-            yaw_rate_rad,
-        )
+    def shutdown(self):
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=5)
 
 
 def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_params, prior_lines=None):
@@ -1090,23 +1031,12 @@ compute_line_history = []
 # ---------------------------------------------------------------------------
 # Pixhawk connection
 # ---------------------------------------------------------------------------
-print(f"Connecting to Pixhawk on {PIXHAWK_PORT} @ {PIXHAWK_BAUD} ...")
-mav_master = None
+print(f"Connecting to Pixhawk via {SERIAL_ADDRESS} ...")
+fc = None
 pixhawk_connected = False
 try:
-    mav_master = mavutil.mavlink_connection(
-        PIXHAWK_PORT, baud=PIXHAWK_BAUD,
-        source_system=FLIGHT_SRC_SYSTEM, source_component=FLIGHT_SRC_COMPONENT,
-    )
-    mav_master.mav.WIRE_PROTOCOL_VERSION = '2.0'
-    os.environ['MAVLINK20'] = '1'
-    mav_master.wait_heartbeat(timeout=10)
-    print(f"Pixhawk connected: system {mav_master.target_system} component {mav_master.target_component}")
-    if mav_master.target_component != 1:
-        mav_master.target_component = 1
-    _hb_thread = threading.Thread(target=_heartbeat_loop, args=(mav_master,), daemon=True)
-    _hb_thread.start()
-    print("GCS heartbeats started")
+    fc = FlightController(SERIAL_ADDRESS)
+    fc.connect()
     pixhawk_connected = True
 except Exception as e:
     print(f"Warning: Could not connect to Pixhawk: {e}")
@@ -1116,31 +1046,23 @@ except Exception as e:
 # Flight startup: offboard mode, arm, takeoff
 # ---------------------------------------------------------------------------
 if pixhawk_connected:
-    health_ok = mav_wait_for_position(mav_master, timeout=30)
+    health_ok = fc.wait_for_position()
     if not health_ok:
         print("Aborting flight: no valid position estimate. Entering vision-only mode.")
         pixhawk_connected = False
     else:
-        print("Streaming initial setpoints for OFFBOARD...")
-        for _ in range(30):
-            send_offboard_setpoint(mav_master, 0, 0, 0, 0)
-            time.sleep(0.067)
-
-        print("Setting OFFBOARD mode...")
-        mav_set_mode(mav_master, "OFFBOARD")
-
-        print("Arming...")
-        mav_arm(mav_master, force=False)
+        fc.start_offboard()
+        fc.arm()
 
         print(f"Climbing to {HOVER_ALTITUDE_M}m...")
-        climb_start = time.time()
-        while time.time() - climb_start < 8.0:
-            send_offboard_setpoint(mav_master, 0, 0, -HOVER_ALTITUDE_M, 0)
-            time.sleep(0.067)
+        fc.set_position_yaw(0, 0, -HOVER_ALTITUDE_M, 0)
+        time.sleep(8.0)
         print("Search altitude reached")
 
 flight_state = "SEARCHING" if pixhawk_connected else "VISION_ONLY"
 flight_state_entered = time.time()
+search_yaw_deg = 0.0
+last_setpoint_time = time.time()
 
 print("Press 'q' to quit.")
 
@@ -1343,27 +1265,30 @@ try:
             green_start_time = None
 
         # --- Flight state machine ---
+        now = time.time()
+        dt = now - last_setpoint_time
+        last_setpoint_time = now
         if flight_state == "SEARCHING":
-            yaw_rate = math.radians(SEARCH_YAW_RATE_DEG_S)
-            send_offboard_setpoint(mav_master, 0, 0, -HOVER_ALTITUDE_M, yaw_rate)
+            search_yaw_deg += SEARCH_YAW_RATE_DEG_S * dt
+            fc.set_position_yaw(0, 0, -HOVER_ALTITUDE_M, search_yaw_deg)
             if green_candidates:
                 target = min(green_candidates, key=lambda c: c["horizontal_dev_deg"])
                 print(f"GREEN branch locked! Angle: {target['horizontal_dev_deg']:.1f} deg, Depth: {target['depth_m']:.2f}m")
                 flight_state = "LOCKED"
-                flight_state_entered = time.time()
+                flight_state_entered = now
             elif yellow_candidates:
                 target = min(yellow_candidates, key=lambda c: c["horizontal_dev_deg"])
                 print(f"YELLOW branch locked! Angle: {target['horizontal_dev_deg']:.1f} deg, Depth: {target['depth_m']:.2f}m")
                 flight_state = "LOCKED"
-                flight_state_entered = time.time()
+                flight_state_entered = now
         elif flight_state == "LOCKED":
-            send_offboard_setpoint(mav_master, 0, 0, -HOVER_ALTITUDE_M, 0)
+            fc.set_position_yaw(0, 0, -HOVER_ALTITUDE_M, search_yaw_deg)
             if green_candidates or yellow_candidates:
-                flight_state_entered = time.time()
-            elif time.time() - flight_state_entered > LOCK_LOST_TIMEOUT_S:
+                flight_state_entered = now
+            elif now - flight_state_entered > LOCK_LOST_TIMEOUT_S:
                 print("Lost branch, resuming search...")
                 flight_state = "SEARCHING"
-                flight_state_entered = time.time()
+                flight_state_entered = now
 
         cv2.putText(
             display_image,
@@ -1621,16 +1546,14 @@ try:
             break
 
 finally:
-    if pixhawk_connected and mav_master is not None:
-        print("Landing...")
-        mav_set_mode(mav_master, "AUTO.LAND")
-        time.sleep(1)
-        mav_land(mav_master)
-        time.sleep(5)
-        print("Disarming...")
-        mav_disarm(mav_master, force=False)
-        _hb_stop.set()
+    if pixhawk_connected and fc is not None:
+        fc.land()
+        time.sleep(10)
+        fc.disarm()
+        fc.shutdown()
         print("Flight shutdown complete")
+    elif fc is not None:
+        fc.shutdown()
     pipeline.stop()
     gui.root.destroy()
     cv2.destroyAllWindows()
