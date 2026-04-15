@@ -1,8 +1,12 @@
 import cv2
+import math
 import numpy as np
+import os
 import serial
+import threading
 import time
 
+from pymavlink import mavutil
 from param_gui import ParamGUI
 
 try:
@@ -81,8 +85,8 @@ HOUGH_LINE_CONNECT_GAP_REFERENCE_DEPTH_M = 1.0
 HOUGH_LINE_CONNECT_GAP_MIN_PX = 105
 HOUGH_LINE_CONNECT_GAP_MAX_PX = 206
 
-MAX_HORIZONTAL_DEVIATION_DEG = 15.0
-MAX_PAIR_ANGLE_DIFF_DEG = 12.0
+MAX_HORIZONTAL_DEVIATION_DEG = 30.0
+MAX_PAIR_ANGLE_DIFF_DEG = 24.0
 MIN_ESTIMATED_LENGTH_M = 0.127  # 5 inches
 MIN_PAIR_GAP_M = 0.0254  # 1 inch
 MAX_PAIR_GAP_M = 0.0889  # 3.5 inches
@@ -108,7 +112,9 @@ BACKGROUND_DEPTH_TOLERANCE_BINS = 2.0
 DRAW_TOP_REGION_LINE = True
 TOP_REGION_COLOR = (255, 255, 0)
 BOX_RED = (0, 0, 255)
+BOX_YELLOW = (0, 255, 255)
 BOX_GREEN = (0, 255, 0)
+YELLOW_HORIZONTAL_DEV_DEG = 15.0
 MAIN_WINDOW_NAME = "D435 Hough Line Branch Detection"
 TRACK_SMOOTHING_ALPHA = 0.35
 TRACK_MAX_MISSING_FRAMES = 4
@@ -116,6 +122,18 @@ TRACK_MATCH_MAX_CENTER_PX = 120.0
 TRACK_MATCH_MIN_IOU = 0.05
 DEBUG_IMAGE_ALPHA = 0.35
 HOUGH_LINE_LINGER_SECONDS = 0.35
+HOUGH_LINE_COMPUTE_LINGER_SECONDS = 0.30
+
+# -----------------------------
+# Flight control (pymavlink)
+# -----------------------------
+PIXHAWK_PORT = os.environ.get('MAV_PORT', '/dev/ttyTHS1')
+PIXHAWK_BAUD = int(os.environ.get('MAV_BAUD', '57600'))
+FLIGHT_SRC_SYSTEM = 255
+FLIGHT_SRC_COMPONENT = 190
+HOVER_ALTITUDE_M = 2.0
+SEARCH_YAW_RATE_DEG_S = 15.0
+LOCK_LOST_TIMEOUT_S = 2.0
 
 
 def safe_set_option(sensor_or_filter, option, value):
@@ -497,10 +515,12 @@ def dominant_depth_from_mask(depth_image, mask, runtime_params):
     }
 
 
-def depth_to_branch_color(depth_m, runtime_params):
+def branch_color(horizontal_dev_deg, depth_m, runtime_params):
+    if horizontal_dev_deg > YELLOW_HORIZONTAL_DEV_DEG:
+        return BOX_RED
     if depth_m <= runtime_params["green_threshold_m"]:
         return BOX_GREEN
-    return BOX_RED
+    return BOX_YELLOW
 
 
 def candidate_score(candidate, image_width):
@@ -644,7 +664,153 @@ def match_tracked_candidate(tracked_candidate, candidates):
     return best_match
 
 
-def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_params):
+# ---------------------------------------------------------------------------
+# pymavlink flight helpers
+# ---------------------------------------------------------------------------
+_mav_send_lock = threading.Lock()
+_hb_stop = threading.Event()
+
+
+def _heartbeat_loop(master):
+    while not _hb_stop.is_set():
+        with _mav_send_lock:
+            master.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0, 0, 0,
+            )
+        time.sleep(1)
+
+
+def mav_flush(master):
+    while master.recv_match(blocking=False):
+        pass
+
+
+def mav_wait_for_ack(master, cmd_id, timeout=5):
+    start = time.time()
+    while time.time() - start < timeout:
+        msg = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=0.5)
+        if msg is None:
+            continue
+        if msg.command == cmd_id:
+            return msg
+    return None
+
+
+def mav_command_long(master, cmd_id, p1=0, p2=0, p3=0, p4=0, p5=0, p6=0, p7=0,
+                     retries=3, timeout=5):
+    for attempt in range(retries):
+        mav_flush(master)
+        with _mav_send_lock:
+            master.mav.command_long_send(
+                master.target_system,
+                master.target_component,
+                cmd_id,
+                attempt,
+                p1, p2, p3, p4, p5, p6, p7,
+            )
+        ack = mav_wait_for_ack(master, cmd_id, timeout=timeout)
+        if ack is not None:
+            return ack
+    return None
+
+
+def mav_wait_for_position(master, timeout=30):
+    """Wait until PX4's EKF has a valid local position estimate."""
+    print(f"Waiting for valid local position estimate (timeout {timeout}s)...")
+    start = time.time()
+    while time.time() - start < timeout:
+        msg = master.recv_match(type='LOCAL_POSITION_NED', blocking=True, timeout=2)
+        if msg is not None:
+            print(f"Local position OK: x={msg.x:.1f} y={msg.y:.1f} z={msg.z:.1f}")
+            return True
+    print("TIMEOUT: No local position estimate. Offboard position commands will NOT work.")
+    print("Check GPS lock or external position source (MOCAP/optical flow).")
+    return False
+
+
+def mav_set_mode(master, mode_name):
+    if mode_name not in master.mode_mapping():
+        print(f"Mode '{mode_name}' not found!")
+        return False
+    mode_id = master.mode_mapping()[mode_name]
+    if isinstance(mode_id, (list, tuple)):
+        base_mode = mode_id[0]
+        main_mode = mode_id[1] if len(mode_id) > 1 else 0
+        sub_mode = mode_id[2] if len(mode_id) > 2 else 0
+    else:
+        base_mode, main_mode, sub_mode = mode_id, 0, 0
+    ack = mav_command_long(
+        master,
+        mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+        p1=float(base_mode), p2=float(main_mode), p3=float(sub_mode),
+    )
+    if ack and ack.result == 0:
+        print(f"Mode set to {mode_name}")
+        return True
+    print(f"Failed to set mode {mode_name}")
+    return False
+
+
+def mav_arm(master, force=True):
+    ack = mav_command_long(
+        master,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        p1=1, p2=21196 if force else 0,
+    )
+    if ack and ack.result == 0:
+        print("Armed!")
+        return True
+    print("Arm failed")
+    return False
+
+
+def mav_disarm(master, force=True):
+    ack = mav_command_long(
+        master,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        p1=0, p2=21196 if force else 0,
+    )
+    if ack and ack.result == 0:
+        print("Disarmed!")
+        return True
+    print("Disarm failed")
+    return False
+
+
+def mav_land(master):
+    ack = mav_command_long(master, mavutil.mavlink.MAV_CMD_NAV_LAND)
+    if ack and ack.result == 0:
+        print("Land accepted")
+        return True
+    print("Land failed")
+    return False
+
+
+def send_offboard_setpoint(master, x, y, z, yaw_rate_rad):
+    """Position hold with yaw rate. z is NED (negative = up)."""
+    type_mask = (
+        (1 << 3) | (1 << 4) | (1 << 5) |  # ignore velocity
+        (1 << 6) | (1 << 7) | (1 << 8) |   # ignore acceleration
+        (1 << 10)                            # ignore yaw (use yaw_rate)
+    )
+    with _mav_send_lock:
+        master.mav.set_position_target_local_ned_send(
+            0,
+            master.target_system,
+            master.target_component,
+            mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+            type_mask,
+            x, y, z,
+            0, 0, 0,
+            0, 0, 0,
+            0,
+            yaw_rate_rad,
+        )
+
+
+def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_params, prior_lines=None):
     image_h, image_w = color_image.shape[:2]
     top_limit = int(image_h * TOP_REGION_FRACTION)
 
@@ -693,11 +859,8 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
 
     raw_hough_lines = list(dict.fromkeys(raw_hough_lines))
     raw_hough_line_count = len(raw_hough_lines)
-    if not raw_hough_lines:
-        reject_reasons["no_lines"] += 1
-        return candidates, [], 0, reject_reasons, edges
 
-    display_hough_lines = raw_hough_lines
+    display_hough_lines = list(raw_hough_lines)
     if runtime_params.get("exclude_background_hough_lines", False):
         display_hough_lines = []
         for line in raw_hough_lines:
@@ -706,8 +869,17 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
             else:
                 reject_reasons["background_hough"] += 1
 
-        if not display_hough_lines:
-            return candidates, [], raw_hough_line_count, reject_reasons, edges
+    current_frame_display_lines = list(display_hough_lines)
+
+    if prior_lines:
+        existing = set(display_hough_lines)
+        for line in prior_lines:
+            if line not in existing:
+                display_hough_lines.append(line)
+
+    if not display_hough_lines:
+        reject_reasons["no_lines"] += 1
+        return candidates, current_frame_display_lines, raw_hough_line_count, reject_reasons, edges
 
     horizontal_lines = []
     for x1, y1, x2, y2 in display_hough_lines:
@@ -852,7 +1024,7 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
             candidates.append(candidate)
 
     candidates = suppress_overlapping_candidates(candidates)
-    return candidates, display_hough_lines, raw_hough_line_count, reject_reasons, edges
+    return candidates, current_frame_display_lines, raw_hough_line_count, reject_reasons, edges
 
 
 pipeline, profile, active_profile = start_pipeline_with_fallback()
@@ -913,6 +1085,62 @@ tracked_missing_frames = 0
 previous_raw_hough_image = None
 previous_canny_debug_image = None
 hough_line_history = []
+compute_line_history = []
+
+# ---------------------------------------------------------------------------
+# Pixhawk connection
+# ---------------------------------------------------------------------------
+print(f"Connecting to Pixhawk on {PIXHAWK_PORT} @ {PIXHAWK_BAUD} ...")
+mav_master = None
+pixhawk_connected = False
+try:
+    mav_master = mavutil.mavlink_connection(
+        PIXHAWK_PORT, baud=PIXHAWK_BAUD,
+        source_system=FLIGHT_SRC_SYSTEM, source_component=FLIGHT_SRC_COMPONENT,
+    )
+    mav_master.mav.WIRE_PROTOCOL_VERSION = '2.0'
+    os.environ['MAVLINK20'] = '1'
+    mav_master.wait_heartbeat(timeout=10)
+    print(f"Pixhawk connected: system {mav_master.target_system} component {mav_master.target_component}")
+    if mav_master.target_component != 1:
+        mav_master.target_component = 1
+    _hb_thread = threading.Thread(target=_heartbeat_loop, args=(mav_master,), daemon=True)
+    _hb_thread.start()
+    print("GCS heartbeats started")
+    pixhawk_connected = True
+except Exception as e:
+    print(f"Warning: Could not connect to Pixhawk: {e}")
+    print("Vision-only mode (no flight control)")
+
+# ---------------------------------------------------------------------------
+# Flight startup: offboard mode, arm, takeoff
+# ---------------------------------------------------------------------------
+if pixhawk_connected:
+    health_ok = mav_wait_for_position(mav_master, timeout=30)
+    if not health_ok:
+        print("Aborting flight: no valid position estimate. Entering vision-only mode.")
+        pixhawk_connected = False
+    else:
+        print("Streaming initial setpoints for OFFBOARD...")
+        for _ in range(30):
+            send_offboard_setpoint(mav_master, 0, 0, 0, 0)
+            time.sleep(0.067)
+
+        print("Setting OFFBOARD mode...")
+        mav_set_mode(mav_master, "OFFBOARD")
+
+        print("Arming...")
+        mav_arm(mav_master, force=False)
+
+        print(f"Climbing to {HOVER_ALTITUDE_M}m...")
+        climb_start = time.time()
+        while time.time() - climb_start < 8.0:
+            send_offboard_setpoint(mav_master, 0, 0, -HOVER_ALTITUDE_M, 0)
+            time.sleep(0.067)
+        print("Search altitude reached")
+
+flight_state = "SEARCHING" if pixhawk_connected else "VISION_ONLY"
+flight_state_entered = time.time()
 
 print("Press 'q' to quit.")
 
@@ -981,12 +1209,23 @@ try:
             cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
 
         # Main Hough-line detector in top half.
+        compute_prune_time = time.time()
+        compute_line_history = [
+            (t, l) for t, l in compute_line_history
+            if compute_prune_time - t <= HOUGH_LINE_COMPUTE_LINGER_SECONDS
+        ]
+        prior_lines = list(dict.fromkeys(l for t, l in compute_line_history))
+
         candidates, raw_hough_lines, raw_hough_line_count, reject_reasons, canny_edges = detect_branch_candidates(
             color_image,
             depth_image,
             COLOR_FOCAL_LENGTH_PX,
             runtime_params,
+            prior_lines=prior_lines,
         )
+
+        for line in raw_hough_lines:
+            compute_line_history.append((time.time(), line))
 
         active_rejects = {k: v for k, v in reject_reasons.items() if v > 0}
         if active_rejects:
@@ -1051,7 +1290,7 @@ try:
 
         # Draw final accepted branch candidates with distance color.
         for candidate in candidates:
-            color = depth_to_branch_color(candidate["depth_m"], runtime_params)
+            color = branch_color(candidate["horizontal_dev_deg"], candidate["depth_m"], runtime_params)
             thickness = 2
 
             cv2.polylines(display_image, [candidate["box"]], True, color, thickness)
@@ -1072,16 +1311,27 @@ try:
 
         display_best_candidate = tracked_best_candidate
         if display_best_candidate is not None:
-            best_color = depth_to_branch_color(display_best_candidate["depth_m"], runtime_params)
+            best_color = branch_color(display_best_candidate["horizontal_dev_deg"], display_best_candidate["depth_m"], runtime_params)
             cv2.polylines(display_image, [display_best_candidate["box"]], True, best_color, 4)
             best_cx, best_cy = display_best_candidate["center"]
             cv2.circle(display_image, (int(best_cx), int(best_cy)), 5, best_color, -1)
 
-        close_count = sum(
-            1 for c in candidates if c["depth_m"] <= runtime_params["green_threshold_m"]
-        )
+        green_candidates = [
+            c for c in candidates
+            if c["horizontal_dev_deg"] <= YELLOW_HORIZONTAL_DEV_DEG
+            and c["depth_m"] <= runtime_params["green_threshold_m"]
+        ]
+        yellow_candidates = [
+            c for c in candidates
+            if c["horizontal_dev_deg"] <= YELLOW_HORIZONTAL_DEV_DEG
+            and c["depth_m"] > runtime_params["green_threshold_m"]
+        ]
+        red_candidates = [
+            c for c in candidates
+            if c["horizontal_dev_deg"] > YELLOW_HORIZONTAL_DEV_DEG
+        ]
 
-        if close_count > 0:
+        if len(green_candidates) > 0:
             if green_start_time is None:
                 green_start_time = time.time()
             elif not curl_sent and (time.time() - green_start_time) >= GREEN_HOLD_SECONDS:
@@ -1092,9 +1342,32 @@ try:
         else:
             green_start_time = None
 
+        # --- Flight state machine ---
+        if flight_state == "SEARCHING":
+            yaw_rate = math.radians(SEARCH_YAW_RATE_DEG_S)
+            send_offboard_setpoint(mav_master, 0, 0, -HOVER_ALTITUDE_M, yaw_rate)
+            if green_candidates:
+                target = min(green_candidates, key=lambda c: c["horizontal_dev_deg"])
+                print(f"GREEN branch locked! Angle: {target['horizontal_dev_deg']:.1f} deg, Depth: {target['depth_m']:.2f}m")
+                flight_state = "LOCKED"
+                flight_state_entered = time.time()
+            elif yellow_candidates:
+                target = min(yellow_candidates, key=lambda c: c["horizontal_dev_deg"])
+                print(f"YELLOW branch locked! Angle: {target['horizontal_dev_deg']:.1f} deg, Depth: {target['depth_m']:.2f}m")
+                flight_state = "LOCKED"
+                flight_state_entered = time.time()
+        elif flight_state == "LOCKED":
+            send_offboard_setpoint(mav_master, 0, 0, -HOVER_ALTITUDE_M, 0)
+            if green_candidates or yellow_candidates:
+                flight_state_entered = time.time()
+            elif time.time() - flight_state_entered > LOCK_LOST_TIMEOUT_S:
+                print("Lost branch, resuming search...")
+                flight_state = "SEARCHING"
+                flight_state_entered = time.time()
+
         cv2.putText(
             display_image,
-            f"Line-pair candidates: {len(candidates)}",
+            f"Candidates: {len(red_candidates)}R {len(yellow_candidates)}Y {len(green_candidates)}G",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
@@ -1103,33 +1376,25 @@ try:
         )
         cv2.putText(
             display_image,
-            f"Close enough (green): {close_count}",
+            f"Close + horizontal (green): {len(green_candidates)}",
             (10, 60),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
-            (0, 255, 0),
+            BOX_GREEN,
             2,
         )
-        red_candidates = [
-            c
-            for c in candidates
-            if c["depth_m"] > runtime_params["green_threshold_m"]
-        ]
-        if red_candidates:
-            closest_red = min(red_candidates, key=lambda c: c["depth_m"])
-            red_angle_deg = closest_red["horizontal_dev_deg"]
-            red_angle_text = (
-                f"Closest red angle: {red_angle_deg:.1f} deg from horizontal"
-            )
+        if yellow_candidates:
+            best_yellow = min(yellow_candidates, key=lambda c: c["horizontal_dev_deg"])
+            yellow_text = f"Best yellow: {best_yellow['horizontal_dev_deg']:.1f} deg, {best_yellow['depth_m']:.2f}m"
         else:
-            red_angle_text = "Closest red angle: n/a"
+            yellow_text = "Yellow: none"
         cv2.putText(
             display_image,
-            red_angle_text,
+            yellow_text,
             (10, 90),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.60,
-            BOX_RED,
+            BOX_YELLOW,
             2,
         )
         cv2.putText(
@@ -1147,7 +1412,7 @@ try:
         )
         cv2.putText(
             raw_hough_image,
-            f"Linger {int(round(HOUGH_LINE_LINGER_SECONDS * 1000.0))} ms",
+            f"Visual {int(round(HOUGH_LINE_LINGER_SECONDS * 1000.0))} ms  Compute {int(round(HOUGH_LINE_COMPUTE_LINGER_SECONDS * 1000.0))} ms",
             (10, 55),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.50,
@@ -1162,7 +1427,7 @@ try:
                 (10, 120),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.65,
-                depth_to_branch_color(display_best_candidate["depth_m"], runtime_params),
+                branch_color(display_best_candidate["horizontal_dev_deg"], display_best_candidate["depth_m"], runtime_params),
                 2,
             )
             cv2.putText(
@@ -1200,6 +1465,17 @@ try:
                 (255, 255, 255),
                 2,
             )
+
+        flight_color = BOX_GREEN if flight_state == "LOCKED" else BOX_YELLOW if flight_state == "SEARCHING" else (255, 255, 255)
+        cv2.putText(
+            display_image,
+            f"Flight: {flight_state}",
+            (10, 240),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            flight_color,
+            2,
+        )
 
         cv2.putText(
             depth_colormap,
@@ -1345,6 +1621,16 @@ try:
             break
 
 finally:
+    if pixhawk_connected and mav_master is not None:
+        print("Landing...")
+        mav_set_mode(mav_master, "AUTO.LAND")
+        time.sleep(1)
+        mav_land(mav_master)
+        time.sleep(5)
+        print("Disarming...")
+        mav_disarm(mav_master, force=False)
+        _hb_stop.set()
+        print("Flight shutdown complete")
     pipeline.stop()
     gui.root.destroy()
     cv2.destroyAllWindows()
