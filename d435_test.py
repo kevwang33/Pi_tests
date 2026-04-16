@@ -8,7 +8,13 @@ import time
 
 from mavsdk import System
 from mavsdk.offboard import OffboardError, PositionNedYaw
-from param_gui import ParamGUI
+
+HEADLESS = not os.environ.get("DISPLAY")
+if HEADLESS:
+    import yaml
+    print("No display detected — running headless (no GUI windows)")
+else:
+    from param_gui import ParamGUI
 
 try:
     import pyrealsense2 as rs
@@ -1004,8 +1010,81 @@ temporal = rs.temporal_filter()
 temporal.set_option(rs.option.filter_smooth_alpha, 0.25)
 temporal.set_option(rs.option.filter_smooth_delta, 30)
 
-gui = ParamGUI("params.yaml")
+if HEADLESS:
+    gui = None
+else:
+    gui = ParamGUI("params.yaml")
 last_camera_settings = {}
+
+
+def _load_headless_params():
+    """Build runtime_params from params.yaml without Tkinter."""
+    from pathlib import Path
+    defaults = {
+        "canny": {"canny_low": 19, "canny_high": 69, "clahe_clip_limit": 6.2},
+        "hough": {
+            "hough_threshold": 131, "hough_min_line_length": 142,
+            "gap_ref_px": 28, "gap_min_px": 105, "gap_max_px": 206,
+            "pair_min_gap_inches_x10": 10, "pair_max_gap_inches_x10": 35,
+            "exclude_background_hough_lines": 1,
+        },
+        "depth": {
+            "min_depth_cm": 4, "max_depth_cm": 200, "green_threshold_cm": 20,
+            "depth_bin_mm": 20, "min_valid_percent": 5,
+            "min_majority_percent": 18, "max_background_percent": 60,
+        },
+        "camera": {
+            "visual_preset": 4, "emitter_enabled": 1, "laser_power": 180,
+            "auto_exposure": 1, "exposure": 8500, "gain": 16,
+            "spatial_magnitude": 1, "spatial_alpha_x100": 35, "spatial_delta": 30,
+            "temporal_alpha_x100": 25, "temporal_delta": 30,
+        },
+    }
+    p = defaults
+    yp = Path("params.yaml")
+    if yp.exists():
+        with open(yp) as f:
+            on_disk = yaml.safe_load(f) or {}
+        for section in p:
+            if section in on_disk and isinstance(on_disk[section], dict):
+                p[section].update(on_disk[section])
+    c, h, d, cam = p["canny"], p["hough"], p["depth"], p["camera"]
+    canny_low = int(max(0, min(254, int(c["canny_low"]))))
+    canny_high = int(max(canny_low + 1, min(255, int(c["canny_high"]))))
+    gap_min_px = max(1, int(h["gap_min_px"]))
+    min_depth_m = max(0.01, int(d["min_depth_cm"]) / 100.0)
+    max_depth_m = max(min_depth_m + 0.01, int(d["max_depth_cm"]) / 100.0)
+    green_threshold_m = min(max(int(d["green_threshold_cm"]) / 100.0, min_depth_m), max_depth_m)
+    return {
+        "canny_low": canny_low, "canny_high": canny_high,
+        "clahe_clip_limit": max(0.1, float(c["clahe_clip_limit"])),
+        "hough_threshold": max(1, int(h["hough_threshold"])),
+        "hough_min_line_length": max(1, int(h["hough_min_line_length"])),
+        "gap_ref_px": max(1, int(h["gap_ref_px"])),
+        "gap_min_px": gap_min_px, "gap_max_px": max(gap_min_px, int(h["gap_max_px"])),
+        "pair_min_gap_m": max(0.0, int(h["pair_min_gap_inches_x10"]) / 10.0 / 39.3701),
+        "pair_max_gap_m": max(0.0, int(h["pair_max_gap_inches_x10"]) / 10.0 / 39.3701),
+        "exclude_background_hough_lines": bool(int(h["exclude_background_hough_lines"])),
+        "min_depth_m": float(min_depth_m), "max_depth_m": float(max_depth_m),
+        "green_threshold_m": float(green_threshold_m),
+        "min_depth_mm": int(round(min_depth_m * 1000.0)),
+        "max_depth_mm": int(round(max_depth_m * 1000.0)),
+        "depth_bin_mm": max(1, int(d["depth_bin_mm"])),
+        "min_valid_ratio": min(1.0, max(0.0, int(d["min_valid_percent"]) / 100.0)),
+        "min_majority_ratio": min(1.0, max(0.0, int(d["min_majority_percent"]) / 100.0)),
+        "max_background_ratio": min(1.0, max(0.0, int(d["max_background_percent"]) / 100.0)),
+        "visual_preset": int(cam["visual_preset"]), "emitter_enabled": int(cam["emitter_enabled"]),
+        "laser_power": int(cam["laser_power"]), "auto_exposure": int(cam["auto_exposure"]),
+        "exposure": max(1, int(cam["exposure"])), "gain": max(1, int(cam["gain"])),
+        "spatial_magnitude": max(1, int(cam["spatial_magnitude"])),
+        "spatial_alpha": max(0.01, int(cam["spatial_alpha_x100"]) / 100.0),
+        "spatial_delta": max(1, int(cam["spatial_delta"])),
+        "temporal_alpha": max(0.01, int(cam["temporal_alpha_x100"]) / 100.0),
+        "temporal_delta": max(1, int(cam["temporal_delta"])),
+    }
+
+
+_headless_params = None
 
 STM32_PORT = '/dev/ttyACM0'
 STM32_BAUD = 115200
@@ -1064,7 +1143,10 @@ flight_state_entered = time.time()
 search_yaw_deg = 0.0
 last_setpoint_time = time.time()
 
-print("Press 'q' to quit.")
+if HEADLESS:
+    print("Headless mode — press Ctrl+C to quit.")
+else:
+    print("Press 'q' to quit.")
 
 try:
     while True:
@@ -1085,7 +1167,8 @@ try:
             continue
 
         color_image = np.asanyarray(color_frame.get_data())
-        display_image = color_image.copy()
+        if not HEADLESS:
+            display_image = color_image.copy()
         depth_raw = np.asanyarray(depth_frame.get_data())
 
         if depth_raw.shape[1] != COLOR_WIDTH or depth_raw.shape[0] != COLOR_HEIGHT:
@@ -1097,8 +1180,13 @@ try:
         else:
             depth_image = depth_raw
 
-        gui.update()
-        runtime_params = gui.get_all_params()
+        if HEADLESS:
+            if _headless_params is None:
+                _headless_params = _load_headless_params()
+            runtime_params = _headless_params
+        else:
+            gui.update()
+            runtime_params = gui.get_all_params()
 
         apply_camera_runtime_params(
             depth_sensor,
@@ -1108,27 +1196,15 @@ try:
             last_camera_settings,
         )
 
-        clipped = np.clip(
-            depth_image,
-            runtime_params["min_depth_mm"],
-            runtime_params["max_depth_mm"],
-        )
-        normalized = (
-            (clipped - runtime_params["min_depth_mm"])
-            / max(
-                1,
-                runtime_params["max_depth_mm"] - runtime_params["min_depth_mm"],
-            )
-            * 255
-        ).astype(np.uint8)
-        depth_colormap = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
-
-        top_limit = int(COLOR_HEIGHT * TOP_REGION_FRACTION)
-        raw_hough_image = np.zeros((COLOR_HEIGHT, COLOR_WIDTH, 3), dtype=np.uint8)
-
-        if DRAW_TOP_REGION_LINE:
-            cv2.line(display_image, (0, top_limit), (COLOR_WIDTH, top_limit), TOP_REGION_COLOR, 2)
-            cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
+        if not HEADLESS:
+            clipped = np.clip(depth_image, runtime_params["min_depth_mm"], runtime_params["max_depth_mm"])
+            normalized = ((clipped - runtime_params["min_depth_mm"]) / max(1, runtime_params["max_depth_mm"] - runtime_params["min_depth_mm"]) * 255).astype(np.uint8)
+            depth_colormap = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+            top_limit = int(COLOR_HEIGHT * TOP_REGION_FRACTION)
+            raw_hough_image = np.zeros((COLOR_HEIGHT, COLOR_WIDTH, 3), dtype=np.uint8)
+            if DRAW_TOP_REGION_LINE:
+                cv2.line(display_image, (0, top_limit), (COLOR_WIDTH, top_limit), TOP_REGION_COLOR, 2)
+                cv2.line(depth_colormap, (0, top_limit), (COLOR_WIDTH, top_limit), (255, 255, 255), 2)
 
         # Main Hough-line detector in top half.
         compute_prune_time = time.time()
@@ -1176,67 +1252,37 @@ try:
                 tracked_best_candidate = None
                 tracked_missing_frames = 0
 
-        canny_debug_base = cv2.cvtColor(canny_edges, cv2.COLOR_GRAY2BGR)
-
-        for line in raw_hough_lines:
-            hough_line_history.append((time.time(), line))
-
-        current_time = time.time()
-        hough_line_history = [
-            (timestamp, line)
-            for timestamp, line in hough_line_history
-            if current_time - timestamp <= HOUGH_LINE_LINGER_SECONDS
-        ]
-        for timestamp, line in hough_line_history:
-            x1, y1, x2, y2 = line
-            age_ratio = np.clip(
-                (current_time - timestamp) / HOUGH_LINE_LINGER_SECONDS,
-                0.0,
-                1.0,
-            )
-            intensity = int(round(255 * (1.0 - 0.7 * age_ratio)))
-            cv2.line(raw_hough_image, (x1, y1), (x2, y2), (0, intensity, intensity), 2)
-
-        raw_hough_image = blend_debug_image(
-            previous_raw_hough_image,
-            raw_hough_image,
-            DEBUG_IMAGE_ALPHA,
-        )
-        canny_debug_image = blend_debug_image(
-            previous_canny_debug_image,
-            canny_debug_base,
-            DEBUG_IMAGE_ALPHA,
-        )
-        previous_raw_hough_image = raw_hough_image.copy()
-        previous_canny_debug_image = canny_debug_image.copy()
-
-        # Draw final accepted branch candidates with distance color.
-        for candidate in candidates:
-            color = branch_color(candidate["horizontal_dev_deg"], candidate["depth_m"], runtime_params)
-            thickness = 2
-
-            cv2.polylines(display_image, [candidate["box"]], True, color, thickness)
-
-            cx, cy = candidate["center"]
-            cv2.circle(display_image, (int(cx), int(cy)), 4, color, -1)
-
-            x, y, w, h = cv2.boundingRect(candidate["box"])
-            cv2.putText(
-                display_image,
-                f"{candidate['depth_m']:.2f}m",
-                (x, max(20, y - 5)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                color,
-                2,
-            )
-
-        display_best_candidate = tracked_best_candidate
-        if display_best_candidate is not None:
-            best_color = branch_color(display_best_candidate["horizontal_dev_deg"], display_best_candidate["depth_m"], runtime_params)
-            cv2.polylines(display_image, [display_best_candidate["box"]], True, best_color, 4)
-            best_cx, best_cy = display_best_candidate["center"]
-            cv2.circle(display_image, (int(best_cx), int(best_cy)), 5, best_color, -1)
+        if not HEADLESS:
+            canny_debug_base = cv2.cvtColor(canny_edges, cv2.COLOR_GRAY2BGR)
+            for line in raw_hough_lines:
+                hough_line_history.append((time.time(), line))
+            current_time = time.time()
+            hough_line_history = [
+                (timestamp, line) for timestamp, line in hough_line_history
+                if current_time - timestamp <= HOUGH_LINE_LINGER_SECONDS
+            ]
+            for timestamp, line in hough_line_history:
+                x1, y1, x2, y2 = line
+                age_ratio = np.clip((current_time - timestamp) / HOUGH_LINE_LINGER_SECONDS, 0.0, 1.0)
+                intensity = int(round(255 * (1.0 - 0.7 * age_ratio)))
+                cv2.line(raw_hough_image, (x1, y1), (x2, y2), (0, intensity, intensity), 2)
+            raw_hough_image = blend_debug_image(previous_raw_hough_image, raw_hough_image, DEBUG_IMAGE_ALPHA)
+            canny_debug_image = blend_debug_image(previous_canny_debug_image, canny_debug_base, DEBUG_IMAGE_ALPHA)
+            previous_raw_hough_image = raw_hough_image.copy()
+            previous_canny_debug_image = canny_debug_image.copy()
+            for candidate in candidates:
+                color = branch_color(candidate["horizontal_dev_deg"], candidate["depth_m"], runtime_params)
+                cv2.polylines(display_image, [candidate["box"]], True, color, 2)
+                cx, cy = candidate["center"]
+                cv2.circle(display_image, (int(cx), int(cy)), 4, color, -1)
+                x, y, w, h = cv2.boundingRect(candidate["box"])
+                cv2.putText(display_image, f"{candidate['depth_m']:.2f}m", (x, max(20, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            display_best_candidate = tracked_best_candidate
+            if display_best_candidate is not None:
+                best_color = branch_color(display_best_candidate["horizontal_dev_deg"], display_best_candidate["depth_m"], runtime_params)
+                cv2.polylines(display_image, [display_best_candidate["box"]], True, best_color, 4)
+                best_cx, best_cy = display_best_candidate["center"]
+                cv2.circle(display_image, (int(best_cx), int(best_cy)), 5, best_color, -1)
 
         green_candidates = [
             c for c in candidates
@@ -1290,260 +1336,46 @@ try:
                 flight_state = "SEARCHING"
                 flight_state_entered = now
 
-        cv2.putText(
-            display_image,
-            f"Candidates: {len(red_candidates)}R {len(yellow_candidates)}Y {len(green_candidates)}G",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            display_image,
-            f"Close + horizontal (green): {len(green_candidates)}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            BOX_GREEN,
-            2,
-        )
-        if yellow_candidates:
-            best_yellow = min(yellow_candidates, key=lambda c: c["horizontal_dev_deg"])
-            yellow_text = f"Best yellow: {best_yellow['horizontal_dev_deg']:.1f} deg, {best_yellow['depth_m']:.2f}m"
-        else:
-            yellow_text = "Yellow: none"
-        cv2.putText(
-            display_image,
-            yellow_text,
-            (10, 90),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
-            BOX_YELLOW,
-            2,
-        )
-        cv2.putText(
-            raw_hough_image,
-            (
-                f"Hough lines: {len(raw_hough_lines)}/{raw_hough_line_count}"
-                if runtime_params.get("exclude_background_hough_lines", False)
-                else f"Hough lines: {len(raw_hough_lines)}"
-            ),
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            raw_hough_image,
-            f"Visual {int(round(HOUGH_LINE_LINGER_SECONDS * 1000.0))} ms  Compute {int(round(HOUGH_LINE_COMPUTE_LINGER_SECONDS * 1000.0))} ms",
-            (10, 55),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (255, 255, 255),
-            1,
-        )
-
-        if display_best_candidate is not None:
-            cv2.putText(
-                display_image,
-                f"Best depth: {display_best_candidate['depth_m']:.2f} m",
-                (10, 120),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                branch_color(display_best_candidate["horizontal_dev_deg"], display_best_candidate["depth_m"], runtime_params),
-                2,
-            )
-            cv2.putText(
-                display_image,
-                f"Length: {display_best_candidate['estimated_length_m'] * 39.3701:.1f} in",
-                (10, 150),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (255, 255, 255),
-                2,
-            )
-            width_text = "Width: n/a"
-            if display_best_candidate.get("pair_gap_m") is not None:
-                width_text = f"Width: {display_best_candidate['pair_gap_m'] * 39.3701:.1f} in"
-            cv2.putText(
-                display_image,
-                width_text,
-                (10, 180),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (255, 255, 255),
-                2,
-            )
-            stability_text = (
-                f"Tracking: stable"
-                if tracked_missing_frames == 0
-                else f"Tracking hold: {tracked_missing_frames}"
-            )
-            cv2.putText(
-                display_image,
-                stability_text,
-                (10, 210),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                2,
-            )
-
-        flight_color = BOX_GREEN if flight_state == "LOCKED" else BOX_YELLOW if flight_state == "SEARCHING" else (255, 255, 255)
-        cv2.putText(
-            display_image,
-            f"Flight: {flight_state}",
-            (10, 240),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            flight_color,
-            2,
-        )
-
-        cv2.putText(
-            depth_colormap,
-            (
-                f"Depth range: {runtime_params['min_depth_m']:.2f}m to "
-                f"{runtime_params['max_depth_m']:.2f}m"
-            ),
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            depth_colormap,
-            (
-                f"Green {runtime_params['green_threshold_m']:.2f}m  "
-                f"Bin {runtime_params['depth_bin_mm']}mm"
-            ),
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            depth_colormap,
-            (
-                f"Valid {runtime_params['min_valid_ratio']:.2f}  "
-                f"Majority {runtime_params['min_majority_ratio']:.2f}"
-            ),
-            (10, 90),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            depth_colormap,
-            f"Max background {runtime_params['max_background_ratio']:.2f}",
-            (10, 120),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            raw_hough_image,
-            "Raw Hough Lines",
-            (10, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            raw_hough_image,
-            (
-                f"Hough {runtime_params['hough_threshold']}  "
-                f"MinLen {runtime_params['hough_min_line_length']}"
-            ),
-            (10, 110),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (255, 255, 255),
-            1,
-        )
-        cv2.putText(
-            raw_hough_image,
-            (
-                f"StitchGap {runtime_params['gap_min_px']}-{runtime_params['gap_max_px']} px"
-            ),
-            (10, 135),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (255, 255, 255),
-            1,
-        )
-        cv2.putText(
-            raw_hough_image,
-            (
-                f"PairGap {runtime_params['pair_min_gap_m'] * 39.3701:.1f}-"
-                f"{runtime_params['pair_max_gap_m'] * 39.3701:.1f} in"
-            ),
-            (10, 160),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (255, 255, 255),
-            1,
-        )
-
-        cv2.putText(
-            canny_debug_image,
-            "Canny Edges",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            canny_debug_image,
-            f"Canny {runtime_params['canny_low']}/{runtime_params['canny_high']}",
-            (10, 60),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (255, 255, 255),
-            1,
-        )
-        cv2.putText(
-            canny_debug_image,
-            f"CLAHE x10 {int(round(runtime_params['clahe_clip_limit'] * 10.0))}",
-            (10, 85),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (255, 255, 255),
-            1,
-        )
-        cv2.putText(
-            raw_hough_image,
-            (
-                "Exclude BG Hough: on"
-                if runtime_params.get("exclude_background_hough_lines", False)
-                else "Exclude BG Hough: off"
-            ),
-            (10, 185),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (255, 255, 255),
-            1,
-        )
-
-        combined = np.vstack(
-            (
-                np.hstack((display_image, depth_colormap)),
-                np.hstack((raw_hough_image, canny_debug_image)),
-            )
-        )
-
-        cv2.imshow(MAIN_WINDOW_NAME, combined)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        if not HEADLESS:
+            cv2.putText(display_image, f"Candidates: {len(red_candidates)}R {len(yellow_candidates)}Y {len(green_candidates)}G", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(display_image, f"Close + horizontal (green): {len(green_candidates)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, BOX_GREEN, 2)
+            if yellow_candidates:
+                best_yellow = min(yellow_candidates, key=lambda c: c["horizontal_dev_deg"])
+                yellow_text = f"Best yellow: {best_yellow['horizontal_dev_deg']:.1f} deg, {best_yellow['depth_m']:.2f}m"
+            else:
+                yellow_text = "Yellow: none"
+            cv2.putText(display_image, yellow_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.60, BOX_YELLOW, 2)
+            cv2.putText(raw_hough_image, (f"Hough lines: {len(raw_hough_lines)}/{raw_hough_line_count}" if runtime_params.get("exclude_background_hough_lines", False) else f"Hough lines: {len(raw_hough_lines)}"), (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(raw_hough_image, f"Visual {int(round(HOUGH_LINE_LINGER_SECONDS * 1000.0))} ms  Compute {int(round(HOUGH_LINE_COMPUTE_LINGER_SECONDS * 1000.0))} ms", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+            display_best_candidate = tracked_best_candidate
+            if display_best_candidate is not None:
+                best_c = branch_color(display_best_candidate["horizontal_dev_deg"], display_best_candidate["depth_m"], runtime_params)
+                cv2.putText(display_image, f"Best depth: {display_best_candidate['depth_m']:.2f} m", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.65, best_c, 2)
+                cv2.putText(display_image, f"Length: {display_best_candidate['estimated_length_m'] * 39.3701:.1f} in", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+                width_text = "Width: n/a"
+                if display_best_candidate.get("pair_gap_m") is not None:
+                    width_text = f"Width: {display_best_candidate['pair_gap_m'] * 39.3701:.1f} in"
+                cv2.putText(display_image, width_text, (10, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+                stability_text = "Tracking: stable" if tracked_missing_frames == 0 else f"Tracking hold: {tracked_missing_frames}"
+                cv2.putText(display_image, stability_text, (10, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            flight_color = BOX_GREEN if flight_state == "LOCKED" else BOX_YELLOW if flight_state == "SEARCHING" else (255, 255, 255)
+            cv2.putText(display_image, f"Flight: {flight_state}", (10, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.55, flight_color, 2)
+            cv2.putText(depth_colormap, f"Depth range: {runtime_params['min_depth_m']:.2f}m to {runtime_params['max_depth_m']:.2f}m", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+            cv2.putText(depth_colormap, f"Green {runtime_params['green_threshold_m']:.2f}m  Bin {runtime_params['depth_bin_mm']}mm", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.putText(depth_colormap, f"Valid {runtime_params['min_valid_ratio']:.2f}  Majority {runtime_params['min_majority_ratio']:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.putText(depth_colormap, f"Max background {runtime_params['max_background_ratio']:.2f}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            cv2.putText(raw_hough_image, "Raw Hough Lines", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+            cv2.putText(raw_hough_image, f"Hough {runtime_params['hough_threshold']}  MinLen {runtime_params['hough_min_line_length']}", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+            cv2.putText(raw_hough_image, f"StitchGap {runtime_params['gap_min_px']}-{runtime_params['gap_max_px']} px", (10, 135), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+            cv2.putText(raw_hough_image, f"PairGap {runtime_params['pair_min_gap_m'] * 39.3701:.1f}-{runtime_params['pair_max_gap_m'] * 39.3701:.1f} in", (10, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+            cv2.putText(canny_debug_image, "Canny Edges", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
+            cv2.putText(canny_debug_image, f"Canny {runtime_params['canny_low']}/{runtime_params['canny_high']}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+            cv2.putText(canny_debug_image, f"CLAHE x10 {int(round(runtime_params['clahe_clip_limit'] * 10.0))}", (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+            cv2.putText(raw_hough_image, ("Exclude BG Hough: on" if runtime_params.get("exclude_background_hough_lines", False) else "Exclude BG Hough: off"), (10, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
+            combined = np.vstack((np.hstack((display_image, depth_colormap)), np.hstack((raw_hough_image, canny_debug_image))))
+            cv2.imshow(MAIN_WINDOW_NAME, combined)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
 finally:
     if pixhawk_connected and fc is not None:
@@ -1555,8 +1387,9 @@ finally:
     elif fc is not None:
         fc.shutdown()
     pipeline.stop()
-    gui.root.destroy()
-    cv2.destroyAllWindows()
+    if not HEADLESS:
+        gui.root.destroy()
+        cv2.destroyAllWindows()
     if stm32_ser is not None and stm32_ser.is_open:
         stm32_ser.close()
         print("STM32 serial connection closed")
