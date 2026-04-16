@@ -1151,22 +1151,26 @@ _quit_flag = threading.Event()
 
 
 def _stdin_listener():
-    """Background thread: waits for 'q' + Enter on stdin to trigger shutdown."""
     try:
         while not _quit_flag.is_set():
             if select.select([sys.stdin], [], [], 0.5)[0]:
-                line = sys.stdin.readline().strip().lower()
-                if line == "q":
+                line = sys.stdin.readline().strip()
+                if line.lower() == "q":
                     print("\n*** KILLSWITCH: 'q' received — landing and shutting down ***")
                     _quit_flag.set()
                     return
+                if line and stm32_ser is not None and stm32_ser.is_open:
+                    stm32_ser.write((line + '\n').encode())
+                    print(f"Sent to STM32: {line}")
+                elif line:
+                    print("STM32 not connected — command ignored")
     except Exception:
         pass
 
 
 _stdin_thread = threading.Thread(target=_stdin_listener, daemon=True)
 _stdin_thread.start()
-print("Press 'q' + Enter to land and quit (works headless and with display).")
+print("Commands: type 'q' to quit, or any STM32 command (curl, uncurl, motor_stop, motor_status, etc.)")
 
 try:
     while not _quit_flag.is_set():
