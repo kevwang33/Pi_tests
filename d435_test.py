@@ -2,7 +2,9 @@ import asyncio
 import cv2
 import numpy as np
 import os
+import select
 import serial
+import sys
 import threading
 import time
 
@@ -1143,13 +1145,29 @@ flight_state_entered = time.time()
 search_yaw_deg = 0.0
 last_setpoint_time = time.time()
 
-if HEADLESS:
-    print("Headless mode — press Ctrl+C to quit.")
-else:
-    print("Press 'q' to quit.")
+_quit_flag = threading.Event()
+
+
+def _stdin_listener():
+    """Background thread: waits for 'q' + Enter on stdin to trigger shutdown."""
+    try:
+        while not _quit_flag.is_set():
+            if select.select([sys.stdin], [], [], 0.5)[0]:
+                line = sys.stdin.readline().strip().lower()
+                if line == "q":
+                    print("\n*** KILLSWITCH: 'q' received — landing and shutting down ***")
+                    _quit_flag.set()
+                    return
+    except Exception:
+        pass
+
+
+_stdin_thread = threading.Thread(target=_stdin_listener, daemon=True)
+_stdin_thread.start()
+print("Press 'q' + Enter to land and quit (works headless and with display).")
 
 try:
-    while True:
+    while not _quit_flag.is_set():
         frames = pipeline.wait_for_frames()
         frames = align.process(frames)
 
@@ -1375,10 +1393,17 @@ try:
             combined = np.vstack((np.hstack((display_image, depth_colormap)), np.hstack((raw_hough_image, canny_debug_image))))
             cv2.imshow(MAIN_WINDOW_NAME, combined)
             if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
+                print("\n*** KILLSWITCH: 'q' key pressed — landing and shutting down ***")
+                _quit_flag.set()
 
 finally:
     if pixhawk_connected and fc is not None:
+        print("Lowering to 1m before landing...")
+        try:
+            fc.set_position_yaw(0, 0, -1.0, search_yaw_deg)
+            time.sleep(4)
+        except Exception as e:
+            print(f"Warning: could not lower altitude: {e}")
         fc.land()
         time.sleep(10)
         fc.disarm()
