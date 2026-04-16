@@ -141,7 +141,7 @@ SERIAL_ADDRESS = os.environ.get(
     f"serial://{os.environ.get('MAV_PORT', '/dev/ttyTHS1')}:"
     f"{os.environ.get('MAV_BAUD', '57600')}",
 )
-HOVER_ALTITUDE_M = 2.0
+HOVER_ALTITUDE_M = 1.0
 SEARCH_YAW_RATE_DEG_S = 15.0
 LOCK_LOST_TIMEOUT_S = 2.0
 HEALTH_TIMEOUT_S = 30
@@ -1398,12 +1398,6 @@ try:
 
 finally:
     if pixhawk_connected and fc is not None:
-        print("Lowering to 1m before landing...")
-        try:
-            fc.set_position_yaw(0, 0, -1.0, search_yaw_deg)
-            time.sleep(4)
-        except Exception as e:
-            print(f"Warning: could not lower altitude: {e}")
         fc.land()
         time.sleep(10)
         fc.disarm()
