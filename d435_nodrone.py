@@ -942,6 +942,8 @@ try:
     stm32_ser = serial.Serial(STM32_PORT, STM32_BAUD, timeout=1)
     print(f"Connected to STM32 on {STM32_PORT}")
     time.sleep(2)
+    stm32_ser.write(b'curl 1500 3\n')
+    print("Sent to STM32: curl 1500 3 (tuck in)")
 except serial.SerialException as e:
     print(f"Warning: Could not open STM32 serial port: {e}")
     stm32_ser = None
@@ -1111,8 +1113,8 @@ try:
                 green_start_time = time.time()
             elif not curl_sent and (time.time() - green_start_time) >= GREEN_HOLD_SECONDS:
                 if stm32_ser is not None and stm32_ser.is_open:
-                    stm32_ser.write(b'curl 2000\n')
-                    print("Sent to STM32: curl 2000")
+                    stm32_ser.write(b'curl -1750 3 1600 4\n')
+                    print("Sent to STM32: curl -1750 3 1600 4")
                 curl_sent = True
         else:
             green_start_time = None
