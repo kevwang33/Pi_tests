@@ -969,6 +969,13 @@ def _stdin_listener():
                     print("\n*** 'q' received — shutting down ***")
                     _quit_flag.set()
                     return
+                if line.lower() == "unperch":
+                    if stm32_ser is not None and stm32_ser.is_open:
+                        stm32_ser.write(b'curl 1400 3 -1100 4\n')
+                        print("Sent to STM32: curl 1400 3 -1100 4 (unperch)")
+                    else:
+                        print("STM32 not connected — command ignored")
+                    continue
                 if line and stm32_ser is not None and stm32_ser.is_open:
                     stm32_ser.write((line + '\n').encode())
                     print(f"Sent to STM32: {line}")
@@ -980,7 +987,7 @@ def _stdin_listener():
 
 _stdin_thread = threading.Thread(target=_stdin_listener, daemon=True)
 _stdin_thread.start()
-print("Commands: type 'q' to quit, or any STM32 command (curl, uncurl, motor_stop, motor_status, etc.)")
+print("Commands: type 'q' to quit, 'unperch' for curl 1400 3 -1100 4, or any STM32 command (curl, uncurl, motor_stop, motor_status, etc.)")
 
 try:
     while not _quit_flag.is_set():
