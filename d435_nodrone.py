@@ -1125,8 +1125,8 @@ try:
                 green_start_time = time.time()
             elif not curl_sent and (time.time() - green_start_time) >= GREEN_HOLD_SECONDS:
                 if stm32_ser is not None and stm32_ser.is_open:
-                    stm32_ser.write(b'curl -1750 3 1600 4.6\n')
-                    print("Sent to STM32: curl -1750 3 1600 4.6")
+                    stm32_ser.write(b'curl -1750 3 1800 4.6\n')
+                    print("Sent to STM32: curl -1750 3 1800 4.6\n")
                 curl_sent = True
         else:
             green_start_time = None
