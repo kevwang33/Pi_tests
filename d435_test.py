@@ -77,11 +77,11 @@ CLAHE_CLIP_LIMIT = 6.2
 CLAHE_TILE_GRID = (8, 8)
 
 # Tighter morphology than before to avoid grabbing too much nearby clutter.
-MORPH_CLOSE_KERNEL = (13, 5)
-MORPH_OPEN_KERNEL = (5, 3)
+MORPH_CLOSE_KERNEL = (5, 13)
+MORPH_OPEN_KERNEL = (3, 5)
 
 # Used to tighten the filled line-pair mask before depth voting.
-MASK_ERODE_KERNEL = (5, 3)
+MASK_ERODE_KERNEL = (3, 5)
 
 # -----------------------------
 # Hough-line / line-pair filters
@@ -94,7 +94,7 @@ HOUGH_LINE_CONNECT_GAP_REFERENCE_DEPTH_M = 1.0
 HOUGH_LINE_CONNECT_GAP_MIN_PX = 105
 HOUGH_LINE_CONNECT_GAP_MAX_PX = 206
 
-MAX_HORIZONTAL_DEVIATION_DEG = 30.0
+MAX_VERTICAL_DEVIATION_DEG = 30.0
 MAX_PAIR_ANGLE_DIFF_DEG = 24.0
 MIN_ESTIMATED_LENGTH_M = 0.127  # 5 inches
 MIN_PAIR_GAP_M = 0.0254  # 1 inch
@@ -103,8 +103,8 @@ MIN_MEASURABLE_PAIR_GAP_PX = 4.0
 MERGE_LINE_ANGLE_DIFF_DEG = 4.0
 MERGE_LINE_OFFSET_PX = 8.0
 MERGE_MIN_OVERLAP_RATIO = 0.60
-PAIR_PAD_X = 10
-PAIR_PAD_Y = 6
+PAIR_PAD_X = 6
+PAIR_PAD_Y = 10
 
 # -----------------------------
 # Depth voting
@@ -123,7 +123,7 @@ TOP_REGION_COLOR = (255, 255, 0)
 BOX_RED = (0, 0, 255)
 BOX_YELLOW = (0, 255, 255)
 BOX_GREEN = (0, 255, 0)
-YELLOW_HORIZONTAL_DEV_DEG = 15.0
+YELLOW_VERTICAL_DEV_DEG = 15.0
 MAIN_WINDOW_NAME = "D435 Hough Line Branch Detection"
 TRACK_SMOOTHING_ALPHA = 0.35
 TRACK_MAX_MISSING_FRAMES = 4
@@ -138,7 +138,7 @@ HOUGH_LINE_COMPUTE_LINGER_SECONDS = 0.30
 # -----------------------------
 SERIAL_ADDRESS = os.environ.get(
     'MAV_ADDRESS',
-    f"serial://{os.environ.get('MAV_PORT', '/dev/ttyTHS1')}:"
+    f"serial://{os.environ.get('MAV_PORT', '/dev/ttyACM0')}:"
     f"{os.environ.get('MAV_BAUD', '57600')}",
 )
 HOVER_ALTITUDE_M = 1.0
@@ -230,8 +230,8 @@ def start_pipeline_with_fallback():
     raise RuntimeError("No supported stream combination could be started.")
 
 
-def horizontal_deviation_degrees(angle):
-    return min(angle, abs(180.0 - angle))
+def vertical_deviation_degrees(angle):
+    return abs(angle - 90.0)
 
 
 def line_angle_degrees(x1, y1, x2, y2):
@@ -285,7 +285,7 @@ def line_direction(line):
     dy = float(y2 - y1)
     length = np.hypot(dx, dy)
     if length <= 0:
-        return np.array([1.0, 0.0], dtype=np.float32)
+        return np.array([0.0, 1.0], dtype=np.float32)
     return np.array([dx / length, dy / length], dtype=np.float32)
 
 
@@ -350,7 +350,7 @@ def merge_similar_hough_lines(lines):
             {
                 "segment": line,
                 "angle_deg": line_angle,
-                "horizontal_dev_deg": horizontal_deviation_degrees(line_angle),
+                "vertical_dev_deg": vertical_deviation_degrees(line_angle),
                 "length_px": line_length(*line),
             }
         )
@@ -526,8 +526,8 @@ def dominant_depth_from_mask(depth_image, mask, runtime_params):
     }
 
 
-def branch_color(horizontal_dev_deg, depth_m, runtime_params):
-    if horizontal_dev_deg > YELLOW_HORIZONTAL_DEV_DEG:
+def branch_color(vertical_dev_deg, depth_m, runtime_params):
+    if vertical_dev_deg > YELLOW_VERTICAL_DEV_DEG:
         return BOX_RED
     if depth_m <= runtime_params["green_threshold_m"]:
         return BOX_GREEN
@@ -539,14 +539,14 @@ def candidate_score(candidate, image_width):
     center_bonus = 1.0 - abs(center_x - image_width / 2.0) / (image_width / 2.0)
     center_bonus = np.clip(center_bonus, 0.0, 1.0)
 
-    horizontal_bonus = 1.0 - candidate["horizontal_dev_deg"] / MAX_HORIZONTAL_DEVIATION_DEG
-    horizontal_bonus = np.clip(horizontal_bonus, 0.0, 1.0)
+    vertical_bonus = 1.0 - candidate["vertical_dev_deg"] / MAX_VERTICAL_DEVIATION_DEG
+    vertical_bonus = np.clip(vertical_bonus, 0.0, 1.0)
 
     length_bonus = np.clip(candidate["estimated_length_m"] / 0.40, 0.0, 1.0)
 
     return (
         0.35 * center_bonus
-        + 0.25 * horizontal_bonus
+        + 0.25 * vertical_bonus
         + 0.25 * length_bonus
         + 0.15 * candidate["majority_ratio"]
     )
@@ -622,7 +622,7 @@ def smooth_candidate(previous_candidate, current_candidate, image_w, image_h):
     for key in (
         "major_axis",
         "minor_axis",
-        "horizontal_dev_deg",
+        "vertical_dev_deg",
         "depth_m",
         "line_a_length_m",
         "line_b_length_m",
@@ -830,18 +830,18 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
         reject_reasons["no_lines"] += 1
         return candidates, current_frame_display_lines, raw_hough_line_count, reject_reasons, edges
 
-    horizontal_lines = []
+    vertical_lines = []
     for x1, y1, x2, y2 in display_hough_lines:
         angle = line_angle_degrees(x1, y1, x2, y2)
-        horizontal_dev = horizontal_deviation_degrees(angle)
-        if horizontal_dev > MAX_HORIZONTAL_DEVIATION_DEG:
+        vertical_dev = vertical_deviation_degrees(angle)
+        if vertical_dev > MAX_VERTICAL_DEVIATION_DEG:
             reject_reasons["angle"] += 1
             continue
 
-        horizontal_lines.append((x1, y1, x2, y2))
+        vertical_lines.append((x1, y1, x2, y2))
 
-    filtered_lines = merge_similar_hough_lines(horizontal_lines)
-    reject_reasons["duplicates"] += max(0, len(horizontal_lines) - len(filtered_lines))
+    filtered_lines = merge_similar_hough_lines(vertical_lines)
+    reject_reasons["duplicates"] += max(0, len(vertical_lines) - len(filtered_lines))
 
     for i in range(len(filtered_lines)):
         line_a = filtered_lines[i]
@@ -874,9 +874,9 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
             box = cv2.boxPoints(rect)
             box = np.int32(box)
 
-            horizontal_angle = longest_edge_angle_deg(box)
-            horizontal_dev = horizontal_deviation_degrees(horizontal_angle)
-            if horizontal_dev > MAX_HORIZONTAL_DEVIATION_DEG:
+            vertical_angle = longest_edge_angle_deg(box)
+            vertical_dev = vertical_deviation_degrees(vertical_angle)
+            if vertical_dev > MAX_VERTICAL_DEVIATION_DEG:
                 reject_reasons["angle"] += 1
                 continue
 
@@ -956,7 +956,7 @@ def detect_branch_candidates(color_image, depth_image, focal_length_px, runtime_
                 "center": (float(cx), float(cy)),
                 "major_axis": float(major_axis),
                 "minor_axis": float(minor_axis),
-                "horizontal_dev_deg": float(horizontal_dev),
+                "vertical_dev_deg": float(vertical_dev),
                 "depth_m": depth_m,
                 "line_a_length_m": float(line_a_length_m),
                 "line_b_length_m": float(line_b_length_m),
@@ -1088,7 +1088,7 @@ def _load_headless_params():
 
 _headless_params = None
 
-STM32_PORT = '/dev/ttyACM0'
+STM32_PORT = '/dev/ttyACM1'
 STM32_BAUD = 115200
 GREEN_HOLD_SECONDS = 0.1
 
@@ -1302,7 +1302,7 @@ try:
             previous_raw_hough_image = raw_hough_image.copy()
             previous_canny_debug_image = canny_debug_image.copy()
             for candidate in candidates:
-                color = branch_color(candidate["horizontal_dev_deg"], candidate["depth_m"], runtime_params)
+                color = branch_color(candidate["vertical_dev_deg"], candidate["depth_m"], runtime_params)
                 cv2.polylines(display_image, [candidate["box"]], True, color, 2)
                 cx, cy = candidate["center"]
                 cv2.circle(display_image, (int(cx), int(cy)), 4, color, -1)
@@ -1310,24 +1310,24 @@ try:
                 cv2.putText(display_image, f"{candidate['depth_m']:.2f}m", (x, max(20, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             display_best_candidate = tracked_best_candidate
             if display_best_candidate is not None:
-                best_color = branch_color(display_best_candidate["horizontal_dev_deg"], display_best_candidate["depth_m"], runtime_params)
+                best_color = branch_color(display_best_candidate["vertical_dev_deg"], display_best_candidate["depth_m"], runtime_params)
                 cv2.polylines(display_image, [display_best_candidate["box"]], True, best_color, 4)
                 best_cx, best_cy = display_best_candidate["center"]
                 cv2.circle(display_image, (int(best_cx), int(best_cy)), 5, best_color, -1)
 
         green_candidates = [
             c for c in candidates
-            if c["horizontal_dev_deg"] <= YELLOW_HORIZONTAL_DEV_DEG
+            if c["vertical_dev_deg"] <= YELLOW_VERTICAL_DEV_DEG
             and c["depth_m"] <= runtime_params["green_threshold_m"]
         ]
         yellow_candidates = [
             c for c in candidates
-            if c["horizontal_dev_deg"] <= YELLOW_HORIZONTAL_DEV_DEG
+            if c["vertical_dev_deg"] <= YELLOW_VERTICAL_DEV_DEG
             and c["depth_m"] > runtime_params["green_threshold_m"]
         ]
         red_candidates = [
             c for c in candidates
-            if c["horizontal_dev_deg"] > YELLOW_HORIZONTAL_DEV_DEG
+            if c["vertical_dev_deg"] > YELLOW_VERTICAL_DEV_DEG
         ]
 
         if len(green_candidates) > 0:
@@ -1349,13 +1349,13 @@ try:
             search_yaw_deg += SEARCH_YAW_RATE_DEG_S * dt
             fc.set_position_yaw(0, 0, -HOVER_ALTITUDE_M, search_yaw_deg)
             if green_candidates:
-                target = min(green_candidates, key=lambda c: c["horizontal_dev_deg"])
-                print(f"GREEN branch locked! Angle: {target['horizontal_dev_deg']:.1f} deg, Depth: {target['depth_m']:.2f}m")
+                target = min(green_candidates, key=lambda c: c["vertical_dev_deg"])
+                print(f"GREEN branch locked! Angle: {target['vertical_dev_deg']:.1f} deg, Depth: {target['depth_m']:.2f}m")
                 flight_state = "LOCKED"
                 flight_state_entered = now
             elif yellow_candidates:
-                target = min(yellow_candidates, key=lambda c: c["horizontal_dev_deg"])
-                print(f"YELLOW branch locked! Angle: {target['horizontal_dev_deg']:.1f} deg, Depth: {target['depth_m']:.2f}m")
+                target = min(yellow_candidates, key=lambda c: c["vertical_dev_deg"])
+                print(f"YELLOW branch locked! Angle: {target['vertical_dev_deg']:.1f} deg, Depth: {target['depth_m']:.2f}m")
                 flight_state = "LOCKED"
                 flight_state_entered = now
         elif flight_state == "LOCKED":
@@ -1369,10 +1369,10 @@ try:
 
         if not HEADLESS:
             cv2.putText(display_image, f"Candidates: {len(red_candidates)}R {len(yellow_candidates)}Y {len(green_candidates)}G", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(display_image, f"Close + horizontal (green): {len(green_candidates)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, BOX_GREEN, 2)
+            cv2.putText(display_image, f"Close + vertical (green): {len(green_candidates)}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, BOX_GREEN, 2)
             if yellow_candidates:
-                best_yellow = min(yellow_candidates, key=lambda c: c["horizontal_dev_deg"])
-                yellow_text = f"Best yellow: {best_yellow['horizontal_dev_deg']:.1f} deg, {best_yellow['depth_m']:.2f}m"
+                best_yellow = min(yellow_candidates, key=lambda c: c["vertical_dev_deg"])
+                yellow_text = f"Best yellow: {best_yellow['vertical_dev_deg']:.1f} deg, {best_yellow['depth_m']:.2f}m"
             else:
                 yellow_text = "Yellow: none"
             cv2.putText(display_image, yellow_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.60, BOX_YELLOW, 2)
@@ -1380,7 +1380,7 @@ try:
             cv2.putText(raw_hough_image, f"Visual {int(round(HOUGH_LINE_LINGER_SECONDS * 1000.0))} ms  Compute {int(round(HOUGH_LINE_COMPUTE_LINGER_SECONDS * 1000.0))} ms", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1)
             display_best_candidate = tracked_best_candidate
             if display_best_candidate is not None:
-                best_c = branch_color(display_best_candidate["horizontal_dev_deg"], display_best_candidate["depth_m"], runtime_params)
+                best_c = branch_color(display_best_candidate["vertical_dev_deg"], display_best_candidate["depth_m"], runtime_params)
                 cv2.putText(display_image, f"Best depth: {display_best_candidate['depth_m']:.2f} m", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.65, best_c, 2)
                 cv2.putText(display_image, f"Length: {display_best_candidate['estimated_length_m'] * 39.3701:.1f} in", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 255, 255), 2)
                 width_text = "Width: n/a"
