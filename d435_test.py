@@ -1088,7 +1088,7 @@ def _load_headless_params():
 
 _headless_params = None
 
-STM32_PORT = '/dev/ttyACM1'
+STM32_PORT = '/dev/ttyACM0'
 STM32_BAUD = 115200
 GREEN_HOLD_SECONDS = 0.1
 
